@@ -173,7 +173,60 @@ def threshold_set(payload: dict = Body(...)):
         THR_OFF_RUNTIME = float(v) if v is not None else None
     return {"ok": True, "thr_on": THR_ON_RUNTIME, "thr_off": THR_OFF_RUNTIME}
 
+# ==========================================================
+# LECTOR DE VIDEO SIN LAG (TIEMPO REAL)
+# ==========================================================
+class RealTimeVideoReader:
+    """
+    Hilo en segundo plano que siempre lee el frame más reciente.
+    Evita que el buffer de OpenCV se acumule cuando YOLO+LSTM
+    no alcanza a procesar tan rápido como llegan los frames de red.
+    """
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        self.ret = False
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
 
+        if self.cap.isOpened():
+            self.ret, self.frame = self.cap.read()
+            self.thread = threading.Thread(target=self._update, daemon=True)
+            self.thread.start()
+
+    def _update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                if ret:
+                    self.frame = frame
+            if not ret:
+                self.running = False
+                break
+
+    def read(self):
+        with self.lock:
+            if self.ret and self.frame is not None:
+                return self.ret, self.frame.copy()
+            return self.ret, None
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def get(self, propId):
+        return self.cap.get(propId)
+
+    def set(self, propId, value):
+        self.cap.set(propId, value)
+
+    def release(self):
+        self.running = False
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=1.0)
+        self.cap.release()
+        
+        
 # ==========================================================
 # CAMERA WORKER
 # ==========================================================
@@ -207,36 +260,46 @@ class CameraWorker:
 
     def _open_capture(self):
         src = self.src
-        
-        # --- NUEVA LÓGICA PARA YOUTUBE ---
-        if "youtube.com" in str(src) or "youtu.be" in str(src):
-            log.info(f"Detectado enlace de YouTube: {src}. Extrayendo stream directo...")
+        is_network_stream = False
+        self.is_live_stream = False
+
+        # --- LÓGICA DE YOUTUBE ---
+        if isinstance(src, str) and ("youtube.com" in src or "youtu.be" in src):
+            log.info(f"Detectado YouTube: {src}. Extrayendo stream...")
             try:
-                # Opciones para yt-dlp: limitamos a 720p máximo para no saturar 
-                # la CPU/Red de RunPod, total YOLO redimensiona a 640/960 igual.
                 ydl_opts = {
-                    'format': 'best[height<=720]/best',
+                    'format': 'best[height<=720][ext=mp4]/best[height<=720]',
                     'quiet': True,
-                    'no_warnings': True
+                    'no_warnings': True,
+                    'noplaylist': True,  # evita romper si el link trae &list=
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(src, download=False)
-                    # Extraemos la URL cruda (m3u8 para vivos, mp4 para pregrabados)
                     src = info['url']
-                    log.info("URL cruda de YouTube extraída exitosamente.")
+                    self.is_live_stream = bool(info.get('is_live'))
+                    is_network_stream = True
+                    log.info(f"URL extraída OK. is_live={self.is_live_stream}")
             except Exception as e:
                 log.error(f"Error extrayendo URL de YouTube: {e}")
                 return None
-        # ---------------------------------
 
-        # Lógica original
         target_src = int(src) if str(src).isdigit() else src
-        cap = cv2.VideoCapture(target_src)
-        
+        if isinstance(target_src, str) and (target_src.startswith("http") or  target_src.startswith("rtsp")):
+            is_network_stream = True
+            os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "10000"
+
+        # --- SELECCIÓN DE LECTOR ---
+        if is_network_stream:
+            log.info("Usando RealTimeVideoReader (0 lag).")
+            cap = RealTimeVideoReader(target_src)
+        else:
+            log.info("Usando cv2.VideoCapture (archivo local).")
+            cap = cv2.VideoCapture(target_src)
+
         if not cap.isOpened():
-            log.error(f"cv2.VideoCapture no pudo abrir: {target_src}")
+            log.error("No se pudo abrir la fuente de video.")
             return None
-            
+
         self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
@@ -245,7 +308,11 @@ class CameraWorker:
         try:
             ok, frame = cap.read()
             if not ok:
-                # ¡TRUCO MAGICO! Si el video se acaba, lo reiniciamos desde el frame 0 (Bucle infinito)
+                # Live real de YouTube o RTSP: no hay "frame 0", se acabó de verdad.
+                if getattr(self, "is_live_stream", False):
+                    log.warning("Live stream finalizado/desconectado.")
+                    return None
+                # Video pregrabado (local o URL de YouTube normal): loop infinito.
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
                 if not ok:
@@ -320,8 +387,6 @@ class CameraWorker:
                 
                 p_win = predict_window(Xw, keras_model, mu, sd,
                         lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
-                p_win = predict_window(Xw, keras_model, mu, sd,
-                        lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
                 self.n_predictions += 1
                 if self.n_predictions > WARMUP_PREDS:
                     self.video_scores.append(p_win)
@@ -392,13 +457,8 @@ class CameraWorker:
                 result = await loop.run_in_executor(_executor, self._grab_and_infer, cap)
                 
                 if result is None:
-                    # MAGIA PARA LA TESIS: Si el video termina y es un archivo local, ¡lo rebobinamos!
-                    if not str(self.src).isdigit() and not str(self.src).startswith("rtsp"):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rebobinar al frame 0
-                        continue # Volver a empezar
-                    else:
-                        await self._broadcast({"type": "error", "msg": "Fin del stream"})
-                        break
+                    await self._broadcast({"type": "error", "msg": "Fin del stream"})
+                    break
 
                 if result["fired_alert"]:
                     await self._broadcast({
