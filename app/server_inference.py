@@ -273,6 +273,9 @@ class CameraWorker:
                     'no_warnings': True,
                     'noplaylist': True,  # evita romper si el link trae &list=
                 }
+                cookies_path = Path("/workspace/app/cookies.txt")
+                if cookies_path.exists():
+                    ydl_opts['cookiefile'] = str(cookies_path)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(src, download=False)
                     src = info['url']

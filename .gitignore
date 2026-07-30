@@ -17,7 +17,7 @@ htmlcov/
 env/
 venv/
 .venv/
-
+app/cookies.txt
 # ------------------------------
 # Local config / IDE
 # ------------------------------
