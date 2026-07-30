@@ -15,3 +15,4 @@ lightgbm
 scikit-learn
 # Ultralytics instala opencv-python como dep; usamos --no-deps para evitar conflicto
 ultralytics==8.4.33
+yt-dlp
