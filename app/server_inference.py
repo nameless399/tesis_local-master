@@ -268,10 +268,10 @@ class CameraWorker:
             log.info(f"Detectado YouTube: {src}. Extrayendo stream...")
             try:
                 ydl_opts = {
-                    'format': 'best[height<=720][ext=mp4]/best[height<=720]',
+                    'format': 'bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/best[height<=720]/best',
                     'quiet': True,
                     'no_warnings': True,
-                    'noplaylist': True,  # evita romper si el link trae &list=
+                    'noplaylist': True,
                 }
                 cookies_path = Path("/workspace/app/cookies.txt")
                 if cookies_path.exists():
