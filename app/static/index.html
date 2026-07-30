@@ -583,6 +583,9 @@ function openWS(serialNumber, src, locationDescription = '', opts = {}) {
         }
       } else if (msg.type === 'alert') {
         addAlert(msg);
+      } else if (msg.type === 'error') {
+        console.error('WS error:', msg.msg);
+        alert('Error de camara: ' + msg.msg);
       }
     } catch (e) {
       console.error(e);
