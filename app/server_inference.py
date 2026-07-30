@@ -12,6 +12,7 @@
 import os
 import time
 import base64
+import yt_dlp
 import asyncio
 import logging
 import threading
@@ -205,10 +206,37 @@ class CameraWorker:
             self.task = asyncio.create_task(self._loop())
 
     def _open_capture(self):
-        src = int(self.src) if self.src.isdigit() else self.src
-        cap = cv2.VideoCapture(src)
+        src = self.src
+        
+        # --- NUEVA LÓGICA PARA YOUTUBE ---
+        if "youtube.com" in str(src) or "youtu.be" in str(src):
+            log.info(f"Detectado enlace de YouTube: {src}. Extrayendo stream directo...")
+            try:
+                # Opciones para yt-dlp: limitamos a 720p máximo para no saturar 
+                # la CPU/Red de RunPod, total YOLO redimensiona a 640/960 igual.
+                ydl_opts = {
+                    'format': 'best[height<=720]/best',
+                    'quiet': True,
+                    'no_warnings': True
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(src, download=False)
+                    # Extraemos la URL cruda (m3u8 para vivos, mp4 para pregrabados)
+                    src = info['url']
+                    log.info("URL cruda de YouTube extraída exitosamente.")
+            except Exception as e:
+                log.error(f"Error extrayendo URL de YouTube: {e}")
+                return None
+        # ---------------------------------
+
+        # Lógica original
+        target_src = int(src) if str(src).isdigit() else src
+        cap = cv2.VideoCapture(target_src)
+        
         if not cap.isOpened():
+            log.error(f"cv2.VideoCapture no pudo abrir: {target_src}")
             return None
+            
         self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
