@@ -8,7 +8,7 @@
 set -euo pipefail
 
 APP_DIR="/workspace/app"
-MODELS_DIR="/workspace/models_mix2"
+MODELS_DIR="/workspace/models_mix3"
 POSE_WEIGHTS="/workspace/yolo11s-pose.pt"
 LOG_FILE="/workspace/infer.log"
 PORT="${PORT:-8000}"
@@ -18,7 +18,7 @@ SESSION="infer"
 # THR_ON  -> probabilidad minima del pooling para disparar alerta
 # THR_OFF -> probabilidad por debajo de la cual se resetea el estado
 # Subir estos valores = menos falsos positivos / alertas mas "duras".
-THR_ON="${THR_ON:-0.65}"
+THR_ON="${THR_ON:-0.75}"
 THR_OFF="${THR_OFF:-0.50}"
 
 log() { echo "[runpod_start] $*"; }
