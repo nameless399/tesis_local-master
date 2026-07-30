@@ -31,11 +31,14 @@ fail() { echo "[runpod_start][ERROR] $*" >&2; exit 1; }
 
 cd "$APP_DIR"
 
-# ── 1) tmux y ffmpeg ──────────────────────────────────────────────
-if ! command -v tmux >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
-  log "apt: instalando tmux y ffmpeg"
+# ── 1) tmux, ffmpeg y nodejs ──────────────────────────────────────
+# nodejs es requerido por yt-dlp para resolver el "n challenge" de
+# YouTube (JS ofuscado); sin runtime de JS, yt-dlp solo devuelve
+# storyboards en vez de streams de video reales.
+if ! command -v tmux >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+  log "apt: instalando tmux, ffmpeg y nodejs"
   apt-get update -qq
-  apt-get install -y -qq tmux ffmpeg >/dev/null
+  apt-get install -y -qq tmux ffmpeg nodejs >/dev/null
 fi
 
 # ── 2) Dependencias Python ───────────────────────────────
@@ -60,6 +63,9 @@ import keras
 print(f"  cv2={cv2.__version__}  tf={tf.__version__}  "
       f"ultralytics={ultralytics.__version__}  keras={keras.__version__}")
 PY
+# ── 3b) Verificar runtime JS para yt-dlp ─────────────────
+command -v node >/dev/null 2>&1 || fail "nodejs no disponible — yt-dlp no podra resolver el JS challenge de YouTube"
+log "nodejs disponible: $(node --version)"
 
 # ── 4) Git pull (best-effort) ────────────────────────────
 log "git pull"
