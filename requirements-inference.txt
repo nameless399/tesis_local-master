@@ -9,7 +9,7 @@ python-dotenv
 numpy
 opencv-python-headless==4.10.0.84
 joblib
-keras==3.12.0
+keras==3.13.2
 tensorflow
 lightgbm
 scikit-learn
