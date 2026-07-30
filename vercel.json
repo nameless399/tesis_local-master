@@ -1,0 +1,23 @@
+{
+  "installCommand": "echo 'skip'",
+  "buildCommand": "npm run build",
+  "outputDirectory": "app/static",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/login.html"
+    },
+    {
+      "source": "/dashboard",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/admin",
+      "destination": "/admin.html"
+    },
+    {
+      "source": "/login_fail",
+      "destination": "/login_fail.html"
+    }
+  ]
+}

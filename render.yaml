@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tesis-videovigilancia-backend
+    runtime: docker
+    plan: free
+    autoDeployTrigger: commit
+    healthCheckPath: /
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: INFERENCE_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: BOSS_CODE
+        sync: false

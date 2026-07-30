@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Panel de Jefe - Sicher</title>
+<link rel="stylesheet" href="/static/admin.css"/>
+<script src="/config.js"></script>
+</head>
+
+<body>
+
+<aside>
+  <div class="brand">
+    <h2>Panel de Jefe</h2>
+    <p id="usuarioHeader">-</p>
+  </div>
+
+  <nav class="navItems">
+    <button class="item active" data-tab="usuarios" onclick="showTab(this,'usuarios')">Usuarios</button>
+    <button class="item" data-tab="camaras" onclick="showTab(this,'camaras')">Camaras</button>
+    <button class="item" data-tab="alertas" onclick="showTab(this,'alertas')">Alertas</button>
+    <button class="item" data-tab="accesos" onclick="showTab(this,'accesos')">Accesos</button>
+    <button class="item" data-tab="acciones" onclick="showTab(this,'acciones')">Acciones</button>
+    <button class="item" data-tab="empresas" onclick="showTab(this,'empresas')">Empresas</button>
+    <button class="item logout" onclick="logout()">Cerrar sesion</button>
+  </nav>
+</aside>
+
+<main>
+  <h1 id="titulo">Usuarios Registrados</h1>
+
+  <section id="usuarios" class="tab">
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Nombre</th><th>Apellido</th><th>Email</th><th>Rol</th><th>Empresa</th><th>Activo</th>
+          </tr>
+        </thead>
+        <tbody id="tblUsuarios"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="camaras" class="tab tab-hidden">
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Serial</th><th>Ubicacion</th><th>Empresa</th><th>Fuente</th><th>Activa</th></tr>
+        </thead>
+        <tbody id="tblCamaras"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="empresas" class="tab tab-hidden">
+    <form id="formEmpresa" class="empresa-form" onsubmit="crearEmpresa(event)">
+      <input id="inpEmpresaNombre" placeholder="Nombre empresa" required class="empresa-input empresa-input-wide"/>
+      <input id="inpEmpresaRut" placeholder="RUT (opcional)" class="empresa-input"/>
+      <button type="submit" class="empresa-submit">Crear empresa</button>
+    </form>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Nombre</th><th>RUT</th><th>Codigo</th><th>Usuarios</th><th>Camaras</th><th>Activa</th></tr>
+        </thead>
+        <tbody id="tblEmpresas"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="alertas" class="tab tab-hidden">
+    <button onclick="clearAlertas()" class="sec">Borrar historial de alertas</button>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Camara</th><th>Probabilidad</th><th>Estado de validacion</th><th>Revisado por</th><th>Fecha/Hora alerta</th><th>Fecha revision</th>
+          </tr>
+        </thead>
+        <tbody id="tblAlertas"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="accesos" class="tab tab-hidden">
+    <button onclick="clearAccesos()" class="sec">Borrar historial de accesos</button>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Usuario</th>
+            <th>Rol</th>
+            <th>Fecha / Hora</th>
+          </tr>
+        </thead>
+        <tbody id="tblAccesos"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="acciones" class="tab tab-hidden">
+    <button onclick="clearAcciones()" class="sec">Borrar historial de acciones</button>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr><th>Usuario</th><th>Camara</th><th>Accion</th><th>Fecha / Hora</th></tr>
+        </thead>
+        <tbody id="tblAcciones"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const apiUrl = path => (window.sicherApiUrl ? window.sicherApiUrl(path) : path);
+const emailKey = 'sicher.email';
+
+function authHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  const email = localStorage.getItem(emailKey);
+  const userId = localStorage.getItem('sicher.user_id');
+  if (email) headers['X-User-Email'] = email;
+  if (userId) headers['X-User-Id'] = userId;
+  return headers;
+}
+
+/* ============================================================
+   Seguridad: solo un JEFE puede ver esta pagina
+============================================================ */
+(function checkAuth(){
+  const token = localStorage.getItem('sicher.token');
+  const role = localStorage.getItem('sicher.role') || localStorage.getItem('sicher.charge');
+
+  if (!token) return window.location.href = '/';
+  if (role !== 'jefe') return window.location.href = '/dashboard';
+
+  const nombre = localStorage.getItem('sicher.nombre') || '';
+  const apellido = localStorage.getItem('sicher.apellido') || '';
+  $('#usuarioHeader').innerHTML = `${nombre} ${apellido}`.trim();
+})();
+
+/* ============================================================
+   Navegacion entre pestañas
+============================================================ */
+function showTab(btn, tab){
+  document.querySelectorAll('.tab').forEach(t => t.classList.add('tab-hidden'));
+  document.getElementById(tab).classList.remove('tab-hidden');
+
+  document.querySelectorAll('.item[data-tab]').forEach(i => i.classList.remove('active'));
+  btn.classList.add('active');
+
+  const titles = {
+    usuarios: 'Usuarios Registrados',
+    camaras: 'Camaras Registradas',
+    alertas: 'Historial de Alertas',
+    accesos: 'Historial de Accesos',
+    acciones: 'Acciones Realizadas',
+    empresas: 'Empresas Registradas'
+  };
+  $('#titulo').innerText = titles[tab] || 'Panel';
+}
+
+function statusLabel(status){
+  if (status === 'true_positive') return 'Confirmado';
+  if (status === 'false_positive') return 'Falsa Alarma';
+  return 'Pendiente';
+}
+
+function statusClass(status){
+  if (status === 'true_positive') return 'status st-true';
+  if (status === 'false_positive') return 'status st-false';
+  return 'status st-pending';
+}
+
+/* ============================================================
+   Cargar datos desde el backend
+============================================================ */
+async function loadUsuarios(){
+  const res = await fetch(apiUrl('/admin/users'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblUsuarios').innerHTML = data.map(u => `
+    <tr>
+      <td>${u.nombre}</td>
+      <td>${u.apellido}</td>
+      <td>${u.email}</td>
+      <td>${u.role || u.charge || '-'}</td>
+      <td>${u.company_name || '-'}</td>
+      <td>${u.is_active ? 'Si' : 'No'}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadAlertas(){
+  const res = await fetch(apiUrl('/admin/logs/alerts'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblAlertas').innerHTML = data.map(a => {
+    const cam = a.serial_number || `#${a.camera_id}`;
+    const reviewer = (a.reviewed_by_name && a.reviewed_by_name !== '-')
+      ? a.reviewed_by_name
+      : (a.reviewed_by_email || '-');
+
+    return `
+      <tr>
+        <td>${cam}</td>
+        <td>${Number(a.prob || 0).toFixed(3)}</td>
+        <td><span class="${statusClass(a.status)}">${statusLabel(a.status)}</span></td>
+        <td>${reviewer}</td>
+        <td>${new Date(a.timestamp * 1000).toLocaleString()}</td>
+        <td>${a.review_timestamp ? new Date(a.review_timestamp * 1000).toLocaleString() : '-'}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function clearAlertas(){
+  if (!confirm('¿Eliminar todas las alertas?')) return;
+  await fetch(apiUrl('/admin/logs/alerts/clear'), { method: 'DELETE', headers: authHeaders() });
+  loadAlertas();
+}
+
+async function loadCamaras(){
+  const res = await fetch(apiUrl('/cameras?include_inactive=true'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblCamaras').innerHTML = data.map(c => `
+    <tr>
+      <td>${c.id}</td>
+      <td>${c.serial_number || c.cam_id}</td>
+      <td>${c.location_description || '-'}</td>
+      <td>${c.company_name || '-'}</td>
+      <td>${c.src}</td>
+      <td>${c.is_active ? 'Si' : 'No'}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadAccesos(){
+  const res = await fetch(apiUrl('/admin/logs/access'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblAccesos').innerHTML = data.map(a => `
+    <tr>
+      <td>${a.usuario}</td>
+      <td>${a.cargo}</td>
+      <td>${new Date(a.timestamp * 1000).toLocaleString()}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadAcciones(){
+  const res = await fetch(apiUrl('/admin/logs/cameras'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblAcciones').innerHTML = data.map(a => `
+    <tr>
+      <td>${a.usuario}</td>
+      <td>${a.serial_number || `#${a.camera_id}`}</td>
+      <td>${a.action}</td>
+      <td>${new Date(a.timestamp * 1000).toLocaleString()}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadEmpresas(){
+  const res = await fetch(apiUrl('/companies'), { headers: authHeaders() });
+  const data = await res.json();
+  $('#tblEmpresas').innerHTML = data.map(e => `
+    <tr>
+      <td>${e.id}</td>
+      <td>${e.name}</td>
+      <td>${e.rut || '-'}</td>
+      <td>${e.codigo || '-'}</td>
+      <td>${e.user_count}</td>
+      <td>${e.camera_count}</td>
+      <td>${e.is_active ? 'Si' : 'No'}</td>
+    </tr>
+  `).join('');
+}
+
+async function crearEmpresa(ev){
+  ev.preventDefault();
+  const nombre = $('#inpEmpresaNombre').value.trim();
+  const rut = $('#inpEmpresaRut').value.trim();
+  const res = await fetch(apiUrl('/companies'), {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({name: nombre, rut: rut || null})
+  });
+  const data = await res.json();
+  if (!res.ok) { alert(data.error || 'Error al crear empresa'); return; }
+  $('#inpEmpresaNombre').value = '';
+  $('#inpEmpresaRut').value = '';
+  loadEmpresas();
+}
+
+/* ============================================================
+   Auto recarga (cada 5 s)
+============================================================ */
+function autoRefresh(){
+  loadUsuarios();
+  loadCamaras();
+  loadAccesos();
+  loadAcciones();
+  loadAlertas();
+  loadEmpresas();
+}
+
+autoRefresh();
+setInterval(autoRefresh, 5000);
+
+/* ============================================================
+   Logout
+============================================================ */
+function logout(){
+  localStorage.clear();
+  window.location.href = '/';
+}
+
+async function clearAccesos(){
+  if (!confirm('¿Seguro que quieres borrar TODO el historial de accesos?')) return;
+  await fetch(apiUrl('/admin/logs/access/clear'), { method: 'DELETE', headers: authHeaders() });
+  loadAccesos();
+}
+
+async function clearAcciones(){
+  if (!confirm('¿Seguro que quieres borrar TODO el historial de acciones?')) return;
+  await fetch(apiUrl('/admin/logs/actions/clear'), { method: 'DELETE', headers: authHeaders() });
+  loadAcciones();
+}
+</script>
+</body>
+</html>

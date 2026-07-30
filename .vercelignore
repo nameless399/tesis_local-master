@@ -1,0 +1,10 @@
+requirements.txt
+models_mix2/
+yolo11s-pose.pt
+*.keras
+*.pkl
+*.npz
+*.pt
+.env
+.venv/
+env/

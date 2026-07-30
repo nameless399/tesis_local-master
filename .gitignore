@@ -1,0 +1,95 @@
+# ------------------------------
+# Python / caches
+# ------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ------------------------------
+# Virtual environments
+# ------------------------------
+env/
+venv/
+.venv/
+
+# ------------------------------
+# Local config / IDE
+# ------------------------------
+.env
+.env.*
+.vscode/
+.idea/
+videosDePelea/
+RWF-2000.zip
+# ------------------------------
+# OS / temp files
+# ------------------------------
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# Front/build artifacts
+# ------------------------------
+node_modules/
+dist/
+build/
+app/static/config.js
+
+# ------------------------------
+# Local DB / runtime artifacts
+# ------------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# ------------------------------
+# Datasets and generated data
+# ------------------------------
+RWF-2000/
+UBI_FIGHTS/
+DATASETS_COMBINADOS/
+Dataset_Le21+GMDCSA24/
+CHAD_VIDEOS/
+anomaly_labels/
+out_npz/
+out_npz_fall/
+out_npz_video/
+data/
+
+# ------------------------------
+# Model artifacts (keep only runtime model folder)
+# ------------------------------
+models/
+models_mix/
+models_mix3/
+yolo*.pt
+!yolo11s-pose.pt
+models_mix2/*
+!models_mix2/lgbm_model.pkl
+!models_mix2/stacker.pkl
+!models_mix2/mix_cnn_lstm_T32_F51.keras
+!models_mix2/mix_cnn_lstm_T32_F51_norm_stats.npz
+!models_mix2/mix_cnn_lstm_T32_F51_threshold.json
+
+# ------------------------------
+# Notebooks checkpoints
+# ------------------------------
+.ipynb_checkpoints/
+
+RWF-2000
+UBI_FIGHTS
+out_npz
+.UBI_FIGHTS
+.RWF-2000
+C:\Users\Usuario\Desktop\tesis-deteccionar-sistema-e5a075def970fe616c6b89be8e343a1c5aacf4e1\UBI_FIGHTS
+C:\Users\Usuario\Desktop\tesis-deteccionar-sistema-e5a075def970fe616c6b89be8e343a1c5aacf4e1\RWF-2000

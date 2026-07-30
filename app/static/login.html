@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sistema de Deteccion</title>
+<link rel="stylesheet" href="/static/login.css"/>
+<script src="/config.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <div class="shell">
+    <div class="logo">
+      <div class="badge">🛡️</div>
+      <h1>Tesis de Deteccion</h1>
+    </div>
+
+    <h2>Iniciar sesion</h2>
+    <div id="err" class="err"></div>
+    <div id="tries" class="mut" style="display:none"></div>
+
+    <label>Correo</label>
+    <input id="email" class="in" placeholder="usuario@vigilia.io" autocomplete="username"/>
+
+    <label>Contrasena</label>
+    <input id="password" type="password" class="in" placeholder="********" autocomplete="current-password"/>
+
+    <div class="row">
+      <label class="mut remember-label">
+        <input id="remember" type="checkbox"/> Recuerdame
+      </label>
+      <div class="mut">
+        <a href="#" onclick="alert('Pide a un jefe restablecer tu clave.');return false;">¿Olvido su contrasena?</a>
+      </div>
+    </div>
+
+    <div class="mt-14">
+      <button id="btn" class="btn">Iniciar sesion</button>
+    </div>
+
+    <div class="foot">
+      <a href="#" onclick="toggleRegistro();return false;">Crear cuenta</a>
+    </div>
+
+    <div id="regBox">
+      <h2>Crear cuenta</h2>
+
+      <div id="regErr" class="err"></div>
+
+      <label>Nombre</label>
+      <input id="reg_nombre" class="in" placeholder="Juan"/>
+
+      <label>Apellido</label>
+      <input id="reg_apellido" class="in" placeholder="Perez"/>
+
+      <label>Correo</label>
+      <input id="reg_email" class="in" placeholder="correo@dominio.com"/>
+
+      <label>Contrasena</label>
+      <input id="reg_pass" type="password" class="in" placeholder="********"/>
+
+      <label>Cargo</label>
+      <select id="reg_charge" class="in" onchange="showCamposRol()">
+        <option value="">Seleccione cargo...</option>
+        <option value="operador">Operador</option>
+        <option value="jefe">Jefe</option>
+      </select>
+
+      <div id="campos_jefe" class="role-fields">
+        <label>Nombre de empresa</label>
+        <input id="reg_empresa" class="in" placeholder="Nombre de su empresa"/>
+        <label>Crear codigo de empresa</label>
+        <input id="reg_codigo" class="in" placeholder="Codigo que usaran sus operadores"/>
+      </div>
+
+      <div id="campos_operador" class="role-fields">
+        <label>Codigo de empresa</label>
+        <input id="reg_codigo_empresa" class="in" placeholder="Codigo proporcionado por su jefe"/>
+      </div>
+
+      <button class="btn mt-12" onclick="registerUser()">Registrarme</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const tokenKey = 'sicher.token';
+const emailKey = 'sicher.email';
+const apiUrl = path => (window.sicherApiUrl ? window.sicherApiUrl(path) : path);
+
+const remembered = localStorage.getItem(emailKey);
+if (remembered) {
+  $('#email').value = remembered;
+  $('#remember').checked = true;
+}
+
+function toggleRegistro() {
+  const box = $('#regBox');
+  box.style.display = (box.style.display === 'block') ? 'none' : 'block';
+}
+
+function showCamposRol() {
+  const cargo = $('#reg_charge').value;
+  $('#campos_jefe').style.display = cargo === 'jefe' ? 'block' : 'none';
+  $('#campos_operador').style.display = cargo === 'operador' ? 'block' : 'none';
+}
+
+async function registerUser() {
+  const cargo = $('#reg_charge').value;
+  const payload = {
+    nombre: $('#reg_nombre').value.trim(),
+    apellido: $('#reg_apellido').value.trim(),
+    email: $('#reg_email').value.trim(),
+    password: $('#reg_pass').value.trim(),
+    charge: cargo,
+    codigo: cargo === 'jefe' ? $('#reg_codigo').value.trim() : $('#reg_codigo_empresa').value.trim(),
+    empresa_nombre: cargo === 'jefe' ? $('#reg_empresa').value.trim() : undefined
+  };
+
+  const res = await fetch(apiUrl('/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  const err = $('#regErr');
+
+  if (!res.ok) {
+    err.style.display = 'block';
+    err.textContent = data.error || 'Error al registrar.';
+    return;
+  }
+
+  err.style.display = 'none';
+  alert('Registro exitoso. Ahora inicia sesion.');
+  toggleRegistro();
+}
+
+async function doLogin() {
+  const btn = $('#btn');
+  const errBox = $('#err');
+
+  const email = $('#email').value.trim();
+  const password = $('#password').value;
+
+  btn.disabled = true;
+  errBox.style.display = 'none';
+
+  try {
+    const res = await fetch(apiUrl('/login'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+
+    const data = await res.json();
+
+    if (res.status === 403 && data.blocked) {
+      errBox.textContent = data.error;
+      errBox.style.display = 'block';
+      if (data.blocked_until) {
+        localStorage.setItem('blocked_until', data.blocked_until);
+      }
+      window.location.href = '/login_fail';
+      return;
+    }
+
+    if (!res.ok) {
+      errBox.textContent = data.error || 'Credenciales invalidas.';
+      errBox.style.display = 'block';
+      btn.disabled = false;
+      return;
+    }
+
+    if ($('#remember').checked) {
+      localStorage.setItem(emailKey, email);
+    } else {
+      localStorage.removeItem(emailKey);
+    }
+
+    const role = data.role || data.charge || 'operador';
+
+    localStorage.setItem(tokenKey, data.access_token);
+    localStorage.setItem('sicher.user_id', String(data.user_id || ''));
+    localStorage.setItem('sicher.email', data.email);
+    localStorage.setItem('sicher.nombre', data.nombre);
+    localStorage.setItem('sicher.apellido', data.apellido);
+    localStorage.setItem('sicher.role', role);
+    localStorage.setItem('sicher.charge', role);
+
+    if (role === 'jefe') {
+      window.location.href = '/admin';
+    } else {
+      window.location.href = '/dashboard';
+    }
+  } catch (e) {
+    errBox.textContent = 'Error de conexion.';
+    errBox.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#btn').onclick = doLogin;
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+</script>
+</body>
+</html>
