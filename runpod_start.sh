@@ -31,11 +31,11 @@ fail() { echo "[runpod_start][ERROR] $*" >&2; exit 1; }
 
 cd "$APP_DIR"
 
-# ── 1) tmux ──────────────────────────────────────────────
+# ── 1) tmux y ffmpeg ──────────────────────────────────────────────
 if ! command -v tmux >/dev/null 2>&1; then
   log "apt: instalando tmux"
   apt-get update -qq
-  apt-get install -y -qq tmux >/dev/null
+  apt-get install -y -qq tmux ffmpeg>/dev/null
 fi
 
 # ── 2) Dependencias Python ───────────────────────────────
