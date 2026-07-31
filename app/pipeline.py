@@ -426,8 +426,9 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     print("TF ve GPU:", tf.config.list_physical_devices('GPU'))
     print("Torch ve GPU:", torch.cuda.is_available())
     print("YOLO device:", pose.device)
+    tf_threads_label = "GPU" if gpus else tf_threads
     print(f"[BOOT] Keras={keras_path.name} | THR_ON={thr_on:.2f} THR_OFF={thr_off:.2f}"
           f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}"
-          f" | TF_threads={tf_threads} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
+          f" | TF_threads={tf_threads_label} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
 
     return keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker
