@@ -83,7 +83,7 @@ htmlcov/
 env/
 venv/
 .venv/
-
+app/cookies.txt
 # ------------------------------
 # Local config / IDE
 # ------------------------------
@@ -6543,11 +6543,14 @@ fail() { echo "[runpod_start][ERROR] $*" >&2; exit 1; }
 
 cd "$APP_DIR"
 
-# ── 1) tmux y ffmpeg ──────────────────────────────────────────────
-if ! command -v tmux >/dev/null 2>&1; then
-  log "apt: instalando tmux"
+# ── 1) tmux, ffmpeg y nodejs ──────────────────────────────────────
+# nodejs es requerido por yt-dlp para resolver el "n challenge" de
+# YouTube (JS ofuscado); sin runtime de JS, yt-dlp solo devuelve
+# storyboards en vez de streams de video reales.
+if ! command -v tmux >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+  log "apt: instalando tmux, ffmpeg y nodejs"
   apt-get update -qq
-  apt-get install -y -qq tmux ffmpeg>/dev/null
+  apt-get install -y -qq tmux ffmpeg nodejs >/dev/null
 fi
 
 # ── 2) Dependencias Python ───────────────────────────────
@@ -6572,6 +6575,9 @@ import keras
 print(f"  cv2={cv2.__version__}  tf={tf.__version__}  "
       f"ultralytics={ultralytics.__version__}  keras={keras.__version__}")
 PY
+# ── 3b) Verificar runtime JS para yt-dlp ─────────────────
+command -v node >/dev/null 2>&1 || fail "nodejs no disponible — yt-dlp no podra resolver el JS challenge de YouTube"
+log "nodejs disponible: $(node --version)"
 
 # ── 4) Git pull (best-effort) ────────────────────────────
 log "git pull"
@@ -8653,7 +8659,60 @@ def threshold_set(payload: dict = Body(...)):
         THR_OFF_RUNTIME = float(v) if v is not None else None
     return {"ok": True, "thr_on": THR_ON_RUNTIME, "thr_off": THR_OFF_RUNTIME}
 
+# ==========================================================
+# LECTOR DE VIDEO SIN LAG (TIEMPO REAL)
+# ==========================================================
+class RealTimeVideoReader:
+    """
+    Hilo en segundo plano que siempre lee el frame más reciente.
+    Evita que el buffer de OpenCV se acumule cuando YOLO+LSTM
+    no alcanza a procesar tan rápido como llegan los frames de red.
+    """
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        self.ret = False
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
 
+        if self.cap.isOpened():
+            self.ret, self.frame = self.cap.read()
+            self.thread = threading.Thread(target=self._update, daemon=True)
+            self.thread.start()
+
+    def _update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                if ret:
+                    self.frame = frame
+            if not ret:
+                self.running = False
+                break
+
+    def read(self):
+        with self.lock:
+            if self.ret and self.frame is not None:
+                return self.ret, self.frame.copy()
+            return self.ret, None
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def get(self, propId):
+        return self.cap.get(propId)
+
+    def set(self, propId, value):
+        self.cap.set(propId, value)
+
+    def release(self):
+        self.running = False
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=1.0)
+        self.cap.release()
+        
+        
 # ==========================================================
 # CAMERA WORKER
 # ==========================================================
@@ -8687,36 +8746,49 @@ class CameraWorker:
 
     def _open_capture(self):
         src = self.src
-        
-        # --- NUEVA LÓGICA PARA YOUTUBE ---
-        if "youtube.com" in str(src) or "youtu.be" in str(src):
-            log.info(f"Detectado enlace de YouTube: {src}. Extrayendo stream directo...")
+        is_network_stream = False
+        self.is_live_stream = False
+
+        # --- LÓGICA DE YOUTUBE ---
+        if isinstance(src, str) and ("youtube.com" in src or "youtu.be" in src):
+            log.info(f"Detectado YouTube: {src}. Extrayendo stream...")
             try:
-                # Opciones para yt-dlp: limitamos a 720p máximo para no saturar 
-                # la CPU/Red de RunPod, total YOLO redimensiona a 640/960 igual.
                 ydl_opts = {
-                    'format': 'best[height<=720]/best',
+                    'format': 'bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/best[height<=720]/best',
                     'quiet': True,
-                    'no_warnings': True
+                    'no_warnings': True,
+                    'noplaylist': True,
                 }
+                cookies_path = Path("/workspace/app/cookies.txt")
+                if cookies_path.exists():
+                    ydl_opts['cookiefile'] = str(cookies_path)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(src, download=False)
-                    # Extraemos la URL cruda (m3u8 para vivos, mp4 para pregrabados)
                     src = info['url']
-                    log.info("URL cruda de YouTube extraída exitosamente.")
+                    self.is_live_stream = bool(info.get('is_live'))
+                    is_network_stream = True
+                    log.info(f"URL extraída OK. is_live={self.is_live_stream}")
             except Exception as e:
                 log.error(f"Error extrayendo URL de YouTube: {e}")
                 return None
-        # ---------------------------------
 
-        # Lógica original
         target_src = int(src) if str(src).isdigit() else src
-        cap = cv2.VideoCapture(target_src)
-        
+        if isinstance(target_src, str) and (target_src.startswith("http") or  target_src.startswith("rtsp")):
+            is_network_stream = True
+            os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "10000"
+
+        # --- SELECCIÓN DE LECTOR ---
+        if is_network_stream:
+            log.info("Usando RealTimeVideoReader (0 lag).")
+            cap = RealTimeVideoReader(target_src)
+        else:
+            log.info("Usando cv2.VideoCapture (archivo local).")
+            cap = cv2.VideoCapture(target_src)
+
         if not cap.isOpened():
-            log.error(f"cv2.VideoCapture no pudo abrir: {target_src}")
+            log.error("No se pudo abrir la fuente de video.")
             return None
-            
+
         self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
@@ -8725,7 +8797,11 @@ class CameraWorker:
         try:
             ok, frame = cap.read()
             if not ok:
-                # ¡TRUCO MAGICO! Si el video se acaba, lo reiniciamos desde el frame 0 (Bucle infinito)
+                # Live real de YouTube o RTSP: no hay "frame 0", se acabó de verdad.
+                if getattr(self, "is_live_stream", False):
+                    log.warning("Live stream finalizado/desconectado.")
+                    return None
+                # Video pregrabado (local o URL de YouTube normal): loop infinito.
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
                 if not ok:
@@ -8800,8 +8876,6 @@ class CameraWorker:
                 
                 p_win = predict_window(Xw, keras_model, mu, sd,
                         lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
-                p_win = predict_window(Xw, keras_model, mu, sd,
-                        lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
                 self.n_predictions += 1
                 if self.n_predictions > WARMUP_PREDS:
                     self.video_scores.append(p_win)
@@ -8872,13 +8946,8 @@ class CameraWorker:
                 result = await loop.run_in_executor(_executor, self._grab_and_infer, cap)
                 
                 if result is None:
-                    # MAGIA PARA LA TESIS: Si el video termina y es un archivo local, ¡lo rebobinamos!
-                    if not str(self.src).isdigit() and not str(self.src).startswith("rtsp"):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rebobinar al frame 0
-                        continue # Volver a empezar
-                    else:
-                        await self._broadcast({"type": "error", "msg": "Fin del stream"})
-                        break
+                    await self._broadcast({"type": "error", "msg": "Fin del stream"})
+                    break
 
                 if result["fired_alert"]:
                     await self._broadcast({
@@ -8945,6 +9014,38 @@ async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
             await ws.receive_text()
     except WebSocketDisconnect:
         worker.clients.discard(ws)
+
+
+================================================================================
+Archivo: app/cookies.txt
+================================================================================
+
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com	TRUE	/	TRUE	1796170537	SOCS	CAISEwgDEgk5MjY0MTExMjMaAmVuIAEaBgiAo4jRBg
+.youtube.com	TRUE	/	FALSE	1800744960	HSID	AHZ8au6Qnp1OdkUFc
+.youtube.com	TRUE	/	TRUE	1800744960	SSID	AtSuUEUWAKGlUWpV5
+.youtube.com	TRUE	/	FALSE	1800744960	APISID	kF_NYG55z1RHUJq_/ABod86OrDdY7DGRZR
+.youtube.com	TRUE	/	TRUE	1800744960	SAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1797958274	LOGIN_INFO	AFmmF2swRAIgKG3Yat1zohGzQfz7KJwGgcjmrFuTp9GWnQM8iJnY350CIFLxI2MyqfjHD43e6T2BF-EV_CSo9IkjoIYY2c_3ozP6:QUQ3MjNmelFBSGRkZkxkcUFOVHRfcy1sMkY4LU9ZZkJ6TUVkSHNwOG9wNks5NUVmZGk4bnJRRWhiWjBVaTlaLUU3Z2FoRVM5T1NmdFIxVWJDZ0ZWaDN5ZlhLZzZ4V1lpclBURUQ0YlJVV243QkZKLTdrVm83WmloaWktUjVVdUxsa1BpN3FxRnVxUVllWkFCZlZEUzJfMnVadlloMGlXaFp3
+.youtube.com	TRUE	/	FALSE	1800744960	SID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyIEDzczfkbLdnDHbeCWWtawACgYKAXASARYSFQHGX2Miufx6iX5nCkvnvWMoOvOWvhoVAUF8yKq3N8arwSBfajTtfjW4-6-l0076
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuynbIK6didk4IdKYu8EkKDtAACgYKAUkSARYSFQHGX2Mi34A6Tqo0pPmvmefoMoSA5RoVAUF8yKrD1FfsH39FnG-bio3qGddG0076
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyl-dP33vjcSJQ8OpKJbIBbAACgYKAWESARYSFQHGX2Mi_KP1IjhvM7hkyInjr69cRhoVAUF8yKqkl5uLA3qPrWoUBx6xuBJm0076
+.youtube.com	TRUE	/	TRUE	1801000432	PREF	f6=40000000&tz=America.Los_Angeles&f7=100&f4=10000
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
+.youtube.com	TRUE	/	FALSE	1801000421	SIDCC	AKEyXzV-11HZf5ttKl-sRnhPwNE--SHpit5asDAaW-Sa0FwtNhWzt2yRqxZEL3bTlg3qsDAFYQ
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDCC	AKEyXzWPKVTLp5KIZ64HeWbzwOv8Pgm4cBxpnBzV_L35xwF4VGgrJgmDLwJ89hiQNS8cAghd
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDCC	AKEyXzX-H26VZZ6_9Gy6q2vVZAoj5kw_Gk0rLoeRCr0I-zL6GUIR3mQt0-bNMTkLN9TVx-3A
+.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_INFO1_LIVE	9aBaVg_bbBo
+.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_PRIVACY_METADATA	CgJOTBIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgPw%3D%3D
+.youtube.com	TRUE	/	TRUE	1800917553	__Secure-YNID	20.YT=OnkJTjNMUh1swUHNSuvrxkjCe3-IIRKLJfXKMv9NR9c5fLJfqYt7huabCrxe6_MmVtyr_mch1QYTEyJZwwVEFq8h6Jzbz90tjRhpkLgv7k3F8tIekr7hGdY_9Hd1DeoKFVAUpA2kxFlaEgO3JOPihTKBN5DRWj0_8rut8nvMQpcJW7DOkgubGF38OUFysSo_80UbjdJN9fkzGHsqCzu6M2gIuqOZ-Y3K6KJDZADeD0qyinU6t-4XctD1w_hJtRZI6FuJuU0yoFCChPvxNDrWROw-HuefDx3j6vLDPtUsVzbA9-4gCd7I9_9MOs9vufr27dK246MIZEZnY-0Wq06lcw
+.youtube.com	TRUE	/	TRUE	1800917553	__Secure-ROLLOUT_TOKEN	CPHZzYf6up3U4wEQj9y8tozElAMYno3z8_z4lQM%3D
+.youtube.com	TRUE	/	TRUE	0	YSC	oq25gmrF4PU
 
 
 ================================================================================
@@ -9887,6 +9988,539 @@ footer {
 
 
 ================================================================================
+Archivo: app/static/login.css
+================================================================================
+
+:root {
+  --bg: #0b0f17;
+  --panel: #0f1522;
+  --card: #0e1421;
+  --mut: #9aa4b2;
+  --txt: #e6edf3;
+  --b: #1e2636;
+  --btn: #335cce;
+}
+
+* { box-sizing: border-box }
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, Segoe UI, Roboto, Arial;
+  background: var(--bg);
+  color: var(--txt);
+}
+
+/* ===========================
+   LAYOUT
+=========================== */
+.wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(80% 60% at 50% 10%, #0f1729 0%, #0b0f17 60%);
+  padding: 16px;
+}
+
+.shell {
+  width: min(92vw, 520px);
+  background: rgba(12, 18, 30, .8);
+  border: 1px solid #1a2234;
+  border-radius: 18px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .35);
+  padding: 28px;
+}
+
+/* ===========================
+   LOGO / HEADINGS
+=========================== */
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.badge {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid #6aa7ff;
+  display: grid;
+  place-items: center;
+}
+
+h1 {
+  font-size: 28px;
+  margin: 0;
+  font-weight: 800;
+  letter-spacing: .3px;
+}
+
+h2 {
+  margin: 12px 0 14px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* ===========================
+   FORM
+=========================== */
+label {
+  display: block;
+  margin: 10px 0 6px;
+  color: var(--mut);
+  font-size: 13px;
+}
+
+.in {
+  width: 100%;
+  min-height: 44px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--b);
+  color: var(--txt);
+  outline: none;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mut { color: var(--mut); font-size: 13px }
+
+.btn {
+  width: 100%;
+  min-height: 44px;
+  padding: 12px 14px;
+  border: none;
+  border-radius: 12px;
+  background: var(--btn);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+.btn:disabled { opacity: .6; cursor: not-allowed }
+
+.foot { text-align: right; margin-top: 10px }
+
+a { color: #8fb3ff; text-decoration: none }
+
+/* ===========================
+   ERROR BOX
+=========================== */
+.err {
+  display: none;
+  margin-bottom: 10px;
+  background: #3a1116;
+  border: 1px solid #6b1f28;
+  color: #ffb4b8;
+  padding: 10px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+/* ===========================
+   REMEMBER / CHECKBOX
+=========================== */
+.remember-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.remember-label input {
+  accent-color: #5f89ff;
+}
+
+/* ===========================
+   REGISTRATION BOX
+=========================== */
+#regBox {
+  display: none;
+  margin-top: 25px;
+  padding-top: 20px;
+  border-top: 1px solid #1a2234;
+}
+
+.role-fields { display: none }
+
+.mt-12 { margin-top: 12px }
+.mt-14 { margin-top: 14px }
+
+/* ===========================
+   RESPONSIVE
+=========================== */
+@media (max-width: 768px) {
+  .shell { padding: 20px }
+  h1 { font-size: 24px }
+  .row { align-items: flex-start }
+  .foot { text-align: left }
+}
+
+
+================================================================================
+Archivo: app/static/login.html
+================================================================================
+
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sistema de Deteccion</title>
+<link rel="stylesheet" href="/static/login.css"/>
+<script src="/config.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <div class="shell">
+    <div class="logo">
+      <div class="badge">🛡️</div>
+      <h1>Tesis de Deteccion</h1>
+    </div>
+
+    <h2>Iniciar sesion</h2>
+    <div id="err" class="err"></div>
+    <div id="tries" class="mut" style="display:none"></div>
+
+    <label>Correo</label>
+    <input id="email" class="in" placeholder="usuario@vigilia.io" autocomplete="username"/>
+
+    <label>Contrasena</label>
+    <input id="password" type="password" class="in" placeholder="********" autocomplete="current-password"/>
+
+    <div class="row">
+      <label class="mut remember-label">
+        <input id="remember" type="checkbox"/> Recuerdame
+      </label>
+      <div class="mut">
+        <a href="#" onclick="alert('Pide a un jefe restablecer tu clave.');return false;">¿Olvido su contrasena?</a>
+      </div>
+    </div>
+
+    <div class="mt-14">
+      <button id="btn" class="btn">Iniciar sesion</button>
+    </div>
+
+    <div class="foot">
+      <a href="#" onclick="toggleRegistro();return false;">Crear cuenta</a>
+    </div>
+
+    <div id="regBox">
+      <h2>Crear cuenta</h2>
+
+      <div id="regErr" class="err"></div>
+
+      <label>Nombre</label>
+      <input id="reg_nombre" class="in" placeholder="Juan"/>
+
+      <label>Apellido</label>
+      <input id="reg_apellido" class="in" placeholder="Perez"/>
+
+      <label>Correo</label>
+      <input id="reg_email" class="in" placeholder="correo@dominio.com"/>
+
+      <label>Contrasena</label>
+      <input id="reg_pass" type="password" class="in" placeholder="********"/>
+
+      <label>Cargo</label>
+      <select id="reg_charge" class="in" onchange="showCamposRol()">
+        <option value="">Seleccione cargo...</option>
+        <option value="operador">Operador</option>
+        <option value="jefe">Jefe</option>
+      </select>
+
+      <div id="campos_jefe" class="role-fields">
+        <label>Nombre de empresa</label>
+        <input id="reg_empresa" class="in" placeholder="Nombre de su empresa"/>
+        <label>Crear codigo de empresa</label>
+        <input id="reg_codigo" class="in" placeholder="Codigo que usaran sus operadores"/>
+      </div>
+
+      <div id="campos_operador" class="role-fields">
+        <label>Codigo de empresa</label>
+        <input id="reg_codigo_empresa" class="in" placeholder="Codigo proporcionado por su jefe"/>
+      </div>
+
+      <button class="btn mt-12" onclick="registerUser()">Registrarme</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const tokenKey = 'sicher.token';
+const emailKey = 'sicher.email';
+const apiUrl = path => (window.sicherApiUrl ? window.sicherApiUrl(path) : path);
+
+const remembered = localStorage.getItem(emailKey);
+if (remembered) {
+  $('#email').value = remembered;
+  $('#remember').checked = true;
+}
+
+function toggleRegistro() {
+  const box = $('#regBox');
+  box.style.display = (box.style.display === 'block') ? 'none' : 'block';
+}
+
+function showCamposRol() {
+  const cargo = $('#reg_charge').value;
+  $('#campos_jefe').style.display = cargo === 'jefe' ? 'block' : 'none';
+  $('#campos_operador').style.display = cargo === 'operador' ? 'block' : 'none';
+}
+
+async function registerUser() {
+  const cargo = $('#reg_charge').value;
+  const payload = {
+    nombre: $('#reg_nombre').value.trim(),
+    apellido: $('#reg_apellido').value.trim(),
+    email: $('#reg_email').value.trim(),
+    password: $('#reg_pass').value.trim(),
+    charge: cargo,
+    codigo: cargo === 'jefe' ? $('#reg_codigo').value.trim() : $('#reg_codigo_empresa').value.trim(),
+    empresa_nombre: cargo === 'jefe' ? $('#reg_empresa').value.trim() : undefined
+  };
+
+  const res = await fetch(apiUrl('/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  const err = $('#regErr');
+
+  if (!res.ok) {
+    err.style.display = 'block';
+    err.textContent = data.error || 'Error al registrar.';
+    return;
+  }
+
+  err.style.display = 'none';
+  alert('Registro exitoso. Ahora inicia sesion.');
+  toggleRegistro();
+}
+
+async function doLogin() {
+  const btn = $('#btn');
+  const errBox = $('#err');
+
+  const email = $('#email').value.trim();
+  const password = $('#password').value;
+
+  btn.disabled = true;
+  errBox.style.display = 'none';
+
+  try {
+    const res = await fetch(apiUrl('/login'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+
+    const data = await res.json();
+
+    if (res.status === 403 && data.blocked) {
+      errBox.textContent = data.error;
+      errBox.style.display = 'block';
+      if (data.blocked_until) {
+        localStorage.setItem('blocked_until', data.blocked_until);
+      }
+      window.location.href = '/login_fail';
+      return;
+    }
+
+    if (!res.ok) {
+      errBox.textContent = data.error || 'Credenciales invalidas.';
+      errBox.style.display = 'block';
+      btn.disabled = false;
+      return;
+    }
+
+    if ($('#remember').checked) {
+      localStorage.setItem(emailKey, email);
+    } else {
+      localStorage.removeItem(emailKey);
+    }
+
+    const role = data.role || data.charge || 'operador';
+
+    localStorage.setItem(tokenKey, data.access_token);
+    localStorage.setItem('sicher.user_id', String(data.user_id || ''));
+    localStorage.setItem('sicher.email', data.email);
+    localStorage.setItem('sicher.nombre', data.nombre);
+    localStorage.setItem('sicher.apellido', data.apellido);
+    localStorage.setItem('sicher.role', role);
+    localStorage.setItem('sicher.charge', role);
+
+    if (role === 'jefe') {
+      window.location.href = '/admin';
+    } else {
+      window.location.href = '/dashboard';
+    }
+  } catch (e) {
+    errBox.textContent = 'Error de conexion.';
+    errBox.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#btn').onclick = doLogin;
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+</script>
+</body>
+</html>
+
+
+================================================================================
+Archivo: app/static/login_fail.css
+================================================================================
+
+:root {
+  --bg: #0b0f17;
+  --panel: #0f1522;
+  --card: #0e1421;
+  --mut: #9aa4b2;
+  --txt: #e6edf3;
+  --b: #1e2636;
+  --btn: #335cce;
+}
+
+* { box-sizing: border-box }
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, Segoe UI, Roboto, Arial;
+  background: var(--bg);
+  color: var(--txt);
+}
+
+.wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(80% 60% at 50% 10%, #0f1729 0%, #0b0f17 60%);
+}
+
+.shell {
+  width: min(92vw, 480px);
+  background: rgba(12, 18, 30, .85);
+  border: 1px solid #1a2234;
+  border-radius: 18px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .35);
+  padding: 32px;
+  text-align: center;
+}
+
+h1 {
+  font-size: 26px;
+  margin: 0 0 10px;
+  font-weight: 800;
+}
+
+p {
+  margin: 8px 0;
+  font-size: 15px;
+  color: var(--mut);
+}
+
+.timer {
+  font-size: 34px;
+  font-weight: 700;
+  margin: 18px 0;
+  color: #ff6b6b;
+  letter-spacing: 1px;
+}
+
+.btn {
+  padding: 10px 18px;
+  border: none;
+  border-radius: 12px;
+  background: var(--btn);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+.btn:disabled { opacity: .6; cursor: not-allowed }
+
+
+================================================================================
+Archivo: app/static/login_fail.html
+================================================================================
+
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Cuenta bloqueada</title>
+<link rel="stylesheet" href="/static/login_fail.css"/>
+<script src="/config.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <div class="shell">
+    <h1>Cuenta bloqueada temporalmente</h1>
+    <p>Por seguridad, se ha superado el número máximo de intentos de inicio de sesión.</p>
+    <p>Podrás volver a intentar en:</p>
+    <div id="timer" class="timer">05:00</div>
+    <p>Por favor, espera o contacta al administrador si el problema persiste.</p>
+    <button id="btn" class="btn" disabled>Volver al inicio de sesión</button>
+  </div>
+</div>
+
+<script>
+const btn = document.getElementById('btn');
+const timerEl = document.getElementById('timer');
+
+let remaining = 5 * 60;
+
+const blockedUntil = localStorage.getItem('blocked_until');
+if (blockedUntil) {
+  const end = new Date(blockedUntil);
+  const diff = Math.floor((end - new Date()) / 1000);
+  if (diff > 0) remaining = diff;
+}
+
+function formatTime(s){
+  const m = String(Math.floor(s/60)).padStart(2,'0');
+  const sec = String(s%60).padStart(2,'0');
+  return `${m}:${sec}`;
+}
+
+function updateTimer(){
+  timerEl.textContent = formatTime(remaining);
+  if(remaining <= 0){
+    clearInterval(interval);
+    btn.disabled = false;
+    btn.textContent = "Reintentar inicio de sesión";
+  } else remaining--;
+}
+
+const interval = setInterval(updateTimer, 1000);
+updateTimer();
+
+btn.onclick = () => {
+  localStorage.removeItem('blocked_until');
+  window.location.href = '/';
+};
+</script>
+</body>
+</html>
+
+
+================================================================================
 Archivo: app/static/index.html
 ================================================================================
 
@@ -10475,6 +11109,9 @@ function openWS(serialNumber, src, locationDescription = '', opts = {}) {
         }
       } else if (msg.type === 'alert') {
         addAlert(msg);
+      } else if (msg.type === 'error') {
+        console.error('WS error:', msg.msg);
+        alert('Error de camara: ' + msg.msg);
       }
     } catch (e) {
       console.error(e);
@@ -10712,539 +11349,6 @@ $('#btnToggleReg').onclick = () => {
   await loadThreshold();
   await loadCameras();
 })();
-</script>
-</body>
-</html>
-
-
-================================================================================
-Archivo: app/static/login.css
-================================================================================
-
-:root {
-  --bg: #0b0f17;
-  --panel: #0f1522;
-  --card: #0e1421;
-  --mut: #9aa4b2;
-  --txt: #e6edf3;
-  --b: #1e2636;
-  --btn: #335cce;
-}
-
-* { box-sizing: border-box }
-
-body {
-  margin: 0;
-  font-family: Inter, system-ui, Segoe UI, Roboto, Arial;
-  background: var(--bg);
-  color: var(--txt);
-}
-
-/* ===========================
-   LAYOUT
-=========================== */
-.wrap {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  background: radial-gradient(80% 60% at 50% 10%, #0f1729 0%, #0b0f17 60%);
-  padding: 16px;
-}
-
-.shell {
-  width: min(92vw, 520px);
-  background: rgba(12, 18, 30, .8);
-  border: 1px solid #1a2234;
-  border-radius: 18px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, .35);
-  padding: 28px;
-}
-
-/* ===========================
-   LOGO / HEADINGS
-=========================== */
-.logo {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.badge {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  border: 2px solid #6aa7ff;
-  display: grid;
-  place-items: center;
-}
-
-h1 {
-  font-size: 28px;
-  margin: 0;
-  font-weight: 800;
-  letter-spacing: .3px;
-}
-
-h2 {
-  margin: 12px 0 14px;
-  font-size: 18px;
-  font-weight: 700;
-}
-
-/* ===========================
-   FORM
-=========================== */
-label {
-  display: block;
-  margin: 10px 0 6px;
-  color: var(--mut);
-  font-size: 13px;
-}
-
-.in {
-  width: 100%;
-  min-height: 44px;
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: var(--card);
-  border: 1px solid var(--b);
-  color: var(--txt);
-  outline: none;
-}
-
-.row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 8px;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.mut { color: var(--mut); font-size: 13px }
-
-.btn {
-  width: 100%;
-  min-height: 44px;
-  padding: 12px 14px;
-  border: none;
-  border-radius: 12px;
-  background: var(--btn);
-  color: #fff;
-  cursor: pointer;
-  font-weight: 600;
-}
-.btn:disabled { opacity: .6; cursor: not-allowed }
-
-.foot { text-align: right; margin-top: 10px }
-
-a { color: #8fb3ff; text-decoration: none }
-
-/* ===========================
-   ERROR BOX
-=========================== */
-.err {
-  display: none;
-  margin-bottom: 10px;
-  background: #3a1116;
-  border: 1px solid #6b1f28;
-  color: #ffb4b8;
-  padding: 10px;
-  border-radius: 10px;
-  font-size: 13px;
-}
-
-/* ===========================
-   REMEMBER / CHECKBOX
-=========================== */
-.remember-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.remember-label input {
-  accent-color: #5f89ff;
-}
-
-/* ===========================
-   REGISTRATION BOX
-=========================== */
-#regBox {
-  display: none;
-  margin-top: 25px;
-  padding-top: 20px;
-  border-top: 1px solid #1a2234;
-}
-
-.role-fields { display: none }
-
-.mt-12 { margin-top: 12px }
-.mt-14 { margin-top: 14px }
-
-/* ===========================
-   RESPONSIVE
-=========================== */
-@media (max-width: 768px) {
-  .shell { padding: 20px }
-  h1 { font-size: 24px }
-  .row { align-items: flex-start }
-  .foot { text-align: left }
-}
-
-
-================================================================================
-Archivo: app/static/login.html
-================================================================================
-
-<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Sistema de Deteccion</title>
-<link rel="stylesheet" href="/static/login.css"/>
-<script src="/config.js"></script>
-</head>
-<body>
-<div class="wrap">
-  <div class="shell">
-    <div class="logo">
-      <div class="badge">🛡️</div>
-      <h1>Tesis de Deteccion</h1>
-    </div>
-
-    <h2>Iniciar sesion</h2>
-    <div id="err" class="err"></div>
-    <div id="tries" class="mut" style="display:none"></div>
-
-    <label>Correo</label>
-    <input id="email" class="in" placeholder="usuario@vigilia.io" autocomplete="username"/>
-
-    <label>Contrasena</label>
-    <input id="password" type="password" class="in" placeholder="********" autocomplete="current-password"/>
-
-    <div class="row">
-      <label class="mut remember-label">
-        <input id="remember" type="checkbox"/> Recuerdame
-      </label>
-      <div class="mut">
-        <a href="#" onclick="alert('Pide a un jefe restablecer tu clave.');return false;">¿Olvido su contrasena?</a>
-      </div>
-    </div>
-
-    <div class="mt-14">
-      <button id="btn" class="btn">Iniciar sesion</button>
-    </div>
-
-    <div class="foot">
-      <a href="#" onclick="toggleRegistro();return false;">Crear cuenta</a>
-    </div>
-
-    <div id="regBox">
-      <h2>Crear cuenta</h2>
-
-      <div id="regErr" class="err"></div>
-
-      <label>Nombre</label>
-      <input id="reg_nombre" class="in" placeholder="Juan"/>
-
-      <label>Apellido</label>
-      <input id="reg_apellido" class="in" placeholder="Perez"/>
-
-      <label>Correo</label>
-      <input id="reg_email" class="in" placeholder="correo@dominio.com"/>
-
-      <label>Contrasena</label>
-      <input id="reg_pass" type="password" class="in" placeholder="********"/>
-
-      <label>Cargo</label>
-      <select id="reg_charge" class="in" onchange="showCamposRol()">
-        <option value="">Seleccione cargo...</option>
-        <option value="operador">Operador</option>
-        <option value="jefe">Jefe</option>
-      </select>
-
-      <div id="campos_jefe" class="role-fields">
-        <label>Nombre de empresa</label>
-        <input id="reg_empresa" class="in" placeholder="Nombre de su empresa"/>
-        <label>Crear codigo de empresa</label>
-        <input id="reg_codigo" class="in" placeholder="Codigo que usaran sus operadores"/>
-      </div>
-
-      <div id="campos_operador" class="role-fields">
-        <label>Codigo de empresa</label>
-        <input id="reg_codigo_empresa" class="in" placeholder="Codigo proporcionado por su jefe"/>
-      </div>
-
-      <button class="btn mt-12" onclick="registerUser()">Registrarme</button>
-    </div>
-
-  </div>
-</div>
-
-<script>
-const $ = s => document.querySelector(s);
-const tokenKey = 'sicher.token';
-const emailKey = 'sicher.email';
-const apiUrl = path => (window.sicherApiUrl ? window.sicherApiUrl(path) : path);
-
-const remembered = localStorage.getItem(emailKey);
-if (remembered) {
-  $('#email').value = remembered;
-  $('#remember').checked = true;
-}
-
-function toggleRegistro() {
-  const box = $('#regBox');
-  box.style.display = (box.style.display === 'block') ? 'none' : 'block';
-}
-
-function showCamposRol() {
-  const cargo = $('#reg_charge').value;
-  $('#campos_jefe').style.display = cargo === 'jefe' ? 'block' : 'none';
-  $('#campos_operador').style.display = cargo === 'operador' ? 'block' : 'none';
-}
-
-async function registerUser() {
-  const cargo = $('#reg_charge').value;
-  const payload = {
-    nombre: $('#reg_nombre').value.trim(),
-    apellido: $('#reg_apellido').value.trim(),
-    email: $('#reg_email').value.trim(),
-    password: $('#reg_pass').value.trim(),
-    charge: cargo,
-    codigo: cargo === 'jefe' ? $('#reg_codigo').value.trim() : $('#reg_codigo_empresa').value.trim(),
-    empresa_nombre: cargo === 'jefe' ? $('#reg_empresa').value.trim() : undefined
-  };
-
-  const res = await fetch(apiUrl('/register'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  const data = await res.json();
-  const err = $('#regErr');
-
-  if (!res.ok) {
-    err.style.display = 'block';
-    err.textContent = data.error || 'Error al registrar.';
-    return;
-  }
-
-  err.style.display = 'none';
-  alert('Registro exitoso. Ahora inicia sesion.');
-  toggleRegistro();
-}
-
-async function doLogin() {
-  const btn = $('#btn');
-  const errBox = $('#err');
-
-  const email = $('#email').value.trim();
-  const password = $('#password').value;
-
-  btn.disabled = true;
-  errBox.style.display = 'none';
-
-  try {
-    const res = await fetch(apiUrl('/login'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-
-    const data = await res.json();
-
-    if (res.status === 403 && data.blocked) {
-      errBox.textContent = data.error;
-      errBox.style.display = 'block';
-      if (data.blocked_until) {
-        localStorage.setItem('blocked_until', data.blocked_until);
-      }
-      window.location.href = '/login_fail';
-      return;
-    }
-
-    if (!res.ok) {
-      errBox.textContent = data.error || 'Credenciales invalidas.';
-      errBox.style.display = 'block';
-      btn.disabled = false;
-      return;
-    }
-
-    if ($('#remember').checked) {
-      localStorage.setItem(emailKey, email);
-    } else {
-      localStorage.removeItem(emailKey);
-    }
-
-    const role = data.role || data.charge || 'operador';
-
-    localStorage.setItem(tokenKey, data.access_token);
-    localStorage.setItem('sicher.user_id', String(data.user_id || ''));
-    localStorage.setItem('sicher.email', data.email);
-    localStorage.setItem('sicher.nombre', data.nombre);
-    localStorage.setItem('sicher.apellido', data.apellido);
-    localStorage.setItem('sicher.role', role);
-    localStorage.setItem('sicher.charge', role);
-
-    if (role === 'jefe') {
-      window.location.href = '/admin';
-    } else {
-      window.location.href = '/dashboard';
-    }
-  } catch (e) {
-    errBox.textContent = 'Error de conexion.';
-    errBox.style.display = 'block';
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-$('#btn').onclick = doLogin;
-document.addEventListener('keydown', e => {
-  if (e.key === 'Enter') doLogin();
-});
-</script>
-</body>
-</html>
-
-
-================================================================================
-Archivo: app/static/login_fail.css
-================================================================================
-
-:root {
-  --bg: #0b0f17;
-  --panel: #0f1522;
-  --card: #0e1421;
-  --mut: #9aa4b2;
-  --txt: #e6edf3;
-  --b: #1e2636;
-  --btn: #335cce;
-}
-
-* { box-sizing: border-box }
-
-body {
-  margin: 0;
-  font-family: Inter, system-ui, Segoe UI, Roboto, Arial;
-  background: var(--bg);
-  color: var(--txt);
-}
-
-.wrap {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  background: radial-gradient(80% 60% at 50% 10%, #0f1729 0%, #0b0f17 60%);
-}
-
-.shell {
-  width: min(92vw, 480px);
-  background: rgba(12, 18, 30, .85);
-  border: 1px solid #1a2234;
-  border-radius: 18px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, .35);
-  padding: 32px;
-  text-align: center;
-}
-
-h1 {
-  font-size: 26px;
-  margin: 0 0 10px;
-  font-weight: 800;
-}
-
-p {
-  margin: 8px 0;
-  font-size: 15px;
-  color: var(--mut);
-}
-
-.timer {
-  font-size: 34px;
-  font-weight: 700;
-  margin: 18px 0;
-  color: #ff6b6b;
-  letter-spacing: 1px;
-}
-
-.btn {
-  padding: 10px 18px;
-  border: none;
-  border-radius: 12px;
-  background: var(--btn);
-  color: #fff;
-  cursor: pointer;
-  font-weight: 600;
-}
-.btn:disabled { opacity: .6; cursor: not-allowed }
-
-
-================================================================================
-Archivo: app/static/login_fail.html
-================================================================================
-
-<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Cuenta bloqueada</title>
-<link rel="stylesheet" href="/static/login_fail.css"/>
-<script src="/config.js"></script>
-</head>
-<body>
-<div class="wrap">
-  <div class="shell">
-    <h1>Cuenta bloqueada temporalmente</h1>
-    <p>Por seguridad, se ha superado el número máximo de intentos de inicio de sesión.</p>
-    <p>Podrás volver a intentar en:</p>
-    <div id="timer" class="timer">05:00</div>
-    <p>Por favor, espera o contacta al administrador si el problema persiste.</p>
-    <button id="btn" class="btn" disabled>Volver al inicio de sesión</button>
-  </div>
-</div>
-
-<script>
-const btn = document.getElementById('btn');
-const timerEl = document.getElementById('timer');
-
-let remaining = 5 * 60;
-
-const blockedUntil = localStorage.getItem('blocked_until');
-if (blockedUntil) {
-  const end = new Date(blockedUntil);
-  const diff = Math.floor((end - new Date()) / 1000);
-  if (diff > 0) remaining = diff;
-}
-
-function formatTime(s){
-  const m = String(Math.floor(s/60)).padStart(2,'0');
-  const sec = String(s%60).padStart(2,'0');
-  return `${m}:${sec}`;
-}
-
-function updateTimer(){
-  timerEl.textContent = formatTime(remaining);
-  if(remaining <= 0){
-    clearInterval(interval);
-    btn.disabled = false;
-    btn.textContent = "Reintentar inicio de sesión";
-  } else remaining--;
-}
-
-const interval = setInterval(updateTimer, 1000);
-updateTimer();
-
-btn.onclick = () => {
-  localStorage.removeItem('blocked_until');
-  window.location.href = '/';
-};
 </script>
 </body>
 </html>

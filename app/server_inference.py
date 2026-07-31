@@ -10,6 +10,11 @@
 # así este servidor no necesita acceso a Supabase.
 
 import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+
 import time
 import base64
 import yt_dlp
@@ -82,8 +87,13 @@ WARMUP_PREDS = int(os.getenv("WARMUP_PREDS", "32"))
 
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
+TARGET_FPS  = float(os.getenv("TARGET_FPS", "12"))
+INFER_SLEEP = max(0.0, 1.0 / TARGET_FPS)
+
+MAX_CAMERA_WORKERS = int(os.getenv("MAX_CAMERA_WORKERS", str(multiprocessing.cpu_count())))
+
 # Thread pool para operaciones bloqueantes (cv2, YOLO, Keras)
-_executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() * 2)
+_executor = ThreadPoolExecutor(max_workers=MAX_CAMERA_WORKERS)
 
 # Modelos pesados: se cargan bajo demanda.
 ARTIFACTS = None
@@ -123,7 +133,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "models_loaded": ARTIFACTS is not None}
+    return {
+        "ok": True,
+        "models_loaded": ARTIFACTS is not None,
+        "target_fps": TARGET_FPS,
+        "max_camera_workers": MAX_CAMERA_WORKERS,
+        "active_cameras": len(WORKERS) if "WORKERS" in globals() else 0,
+    }
 
 
 # ── Overlay toggle ────────────────────────────────────────
@@ -483,7 +499,7 @@ class CameraWorker:
 
                 # MAGIA 2: Frenamos el servidor 0.03 segundos para que vaya a 30 FPS.
                 # ¡Esto evita que el navegador colapse y quite la pantalla negra!
-                await asyncio.sleep(0.033)
+                await asyncio.sleep(INFER_SLEEP)
         finally:
             await loop.run_in_executor(_executor, cap.release)
             self.running = False

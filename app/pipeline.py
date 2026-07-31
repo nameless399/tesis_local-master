@@ -305,7 +305,7 @@ def predict_window(Xw: np.ndarray, keras_model, mu, sd,
     # --- Keras (LSTM) ---
     X = Xw[np.newaxis, ...]
     X = norm_apply(X, mu, sd)
-    p_keras = float(keras_model.predict(X, verbose=0).ravel()[0])
+    p_keras = float(keras_model(X, training=False).numpy().ravel()[0])
 
     if lgbm is None or fusion_w <= 0.0:
         return np.clip(p_keras, 0.0, 1.0)
@@ -343,10 +343,19 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     """
     import tensorflow as tf
     tf.config.set_visible_devices([], 'GPU') 
-
+    
+    tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
+        tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
+    except RuntimeError:
+        pass
+    
     from keras.models import load_model
     from ultralytics import YOLO
     import torch
+    
+    torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "2")))
 
     models_dir = Path(models_dir)
 
@@ -407,6 +416,7 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     print("Torch ve GPU:", torch.cuda.is_available())
     print("YOLO device:", pose.device)
     print(f"[BOOT] Keras={keras_path.name} | THR_ON={thr_on:.2f} THR_OFF={thr_off:.2f}"
-          f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}")
+          f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}"
+          f" | TF_threads={tf_threads} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
 
     return keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker
