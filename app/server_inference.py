@@ -1,19 +1,21 @@
 # uvicorn app.server_inference:app --host 0.0.0.0 --port 8000
 #
 # Servidor de INFERENCIA (se despliega en RunPod con GPU).
-#   - YOLO + LSTM + LGBM
-#   - WebSocket /ws/stream/{cam_id}?src=... para streaming + detección
+#   - YOLO (batcheado entre camaras) + LSTM + LGBM
+#   - WebSocket /ws/stream/{cam_id}?src=... para streaming + deteccion
 #   - /overlay/get y /overlay/set para togglear el render de poses
 #   - SIN base de datos, SIN auth, SIN HTML
 #
-# El src de la cámara se recibe como query param (lo envía el frontend),
-# así este servidor no necesita acceso a Supabase.
+# El src de la camara se recibe como query param (lo envia el frontend),
+# asi este servidor no necesita acceso a Supabase.
 
 import os
 
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("MKL_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_THREADS", "1")
+os.environ.setdefault("TORCH_NUM_THREADS", "1")
 
 import time
 import base64
@@ -29,11 +31,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import cv2
-
-from app.pipeline import (
-    SEQ_LEN, pool_frame_to_110, pool_scores,
-    predict_window, load_artifacts, smooth_window
-)
 
 try:
     cv2.setNumThreads(1)
@@ -51,20 +48,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.pipeline import (
     SEQ_LEN, pool_frame_to_110, pool_scores,
-    predict_window, load_artifacts,
+    predict_window, load_artifacts, smooth_window,
 )
 
 load_dotenv()
 log = logging.getLogger("inference")
 
 # ==========================================================
-# CONFIGURACIÓN
+# CONFIGURACION
 # ==========================================================
 MODELS_DIR   = Path(os.getenv("MODELS_DIR", "models_mix3"))
 POSE_WEIGHTS = os.getenv("POSE_WEIGHTS", "yolo11s-pose.pt")
 
 IMGSZ, CONF_POSE, IOU_POSE = 640, 0.25, 0.50
-TOPK = 4
 
 CONF_MIN     = 0.10
 POOL_METHOD  = "topk"
@@ -75,11 +71,19 @@ FUSION_W = 0.0
 VIDEO_MAX_SCORES = 900
 DRAW_OVERLAY     = True
 
+# Umbral de distancia (px) para considerar que una deteccion en el frame
+# actual es la misma persona que ocupaba un slot en el frame anterior.
+TRACK_DIST_PX = 300
+# Confianza minima para "reclamar" un slot libre (persona nueva en escena).
+TRACK_CONF_MIN = 0.70
+TRACK_MISSING_TOLERANCE = 15  # frames de tolerancia antes de soltar el slot
+
 # Override en runtime de los umbrales del modelo. None => usar el valor
 # cargado desde el JSON del modelo (o THR_ON/THR_OFF env var). Se puede
 # modificar en caliente con POST /threshold/set.
 THR_ON_RUNTIME: float | None = None
 THR_OFF_RUNTIME: float | None = None
+LAST_TICK_MS: float = 0.0
 
 # Predicciones de warmup tras llenar la ventana inicial: se descartan del
 # pooling y no pueden disparar alertas (evita "spike" inicial del LSTM).
@@ -87,6 +91,8 @@ WARMUP_PREDS = int(os.getenv("WARMUP_PREDS", "32"))
 
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
+# TARGET_FPS ahora es la cadencia del scheduler GLOBAL (un tick procesa
+# TODAS las camaras activas en un solo batch), no un loop por camara.
 TARGET_FPS  = float(os.getenv("TARGET_FPS", "12"))
 INFER_SLEEP = max(0.0, 1.0 / TARGET_FPS)
 
@@ -133,12 +139,15 @@ def root():
 
 @app.get("/health")
 def health():
+    active = sum(1 for w in WORKERS.values() if w.running and w.clients)
     return {
         "ok": True,
         "models_loaded": ARTIFACTS is not None,
         "target_fps": TARGET_FPS,
         "max_camera_workers": MAX_CAMERA_WORKERS,
-        "active_cameras": len(WORKERS) if "WORKERS" in globals() else 0,
+        "active_cameras": active,
+        "registered_cameras": len(WORKERS),
+        "last_tick_ms": round(LAST_TICK_MS, 1),
     }
 
 
@@ -157,9 +166,6 @@ def overlay_set(payload: dict = Body(...)):
 # ── Thresholds (runtime override) ─────────────────────────
 @app.get("/threshold/get")
 def threshold_get():
-    """
-    Devuelve umbrales efectivos (override si existe, sino los del modelo).
-    """
     thr_on_model = None
     thr_off_model = None
     if ARTIFACTS is not None:
@@ -176,10 +182,6 @@ def threshold_get():
 
 @app.post("/threshold/set")
 def threshold_set(payload: dict = Body(...)):
-    """
-    Setea override de THR_ON / THR_OFF. Manda null para limpiar override.
-    Body: { "thr_on": 0.70, "thr_off": 0.55 }
-    """
     global THR_ON_RUNTIME, THR_OFF_RUNTIME
     if "thr_on" in payload:
         v = payload["thr_on"]
@@ -189,14 +191,15 @@ def threshold_set(payload: dict = Body(...)):
         THR_OFF_RUNTIME = float(v) if v is not None else None
     return {"ok": True, "thr_on": THR_ON_RUNTIME, "thr_off": THR_OFF_RUNTIME}
 
+
 # ==========================================================
 # LECTOR DE VIDEO SIN LAG (TIEMPO REAL)
 # ==========================================================
 class RealTimeVideoReader:
     """
-    Hilo en segundo plano que siempre lee el frame más reciente.
-    Evita que el buffer de OpenCV se acumule cuando YOLO+LSTM
-    no alcanza a procesar tan rápido como llegan los frames de red.
+    Hilo en segundo plano que siempre lee el frame mas reciente.
+    Evita que el buffer de OpenCV se acumule cuando el scheduler
+    no alcanza a procesar tan rapido como llegan los frames de red.
     """
     def __init__(self, src):
         self.cap = cv2.VideoCapture(src)
@@ -241,45 +244,65 @@ class RealTimeVideoReader:
         if hasattr(self, 'thread'):
             self.thread.join(timeout=1.0)
         self.cap.release()
-        
-        
+
+
 # ==========================================================
 # CAMERA WORKER
 # ==========================================================
 class CameraWorker:
+    """
+    Ya NO corre su propio loop de inferencia. Solo abre la fuente de video,
+    sabe leer un frame cuando el scheduler se lo pide, y postprocesa el
+    resultado de YOLO que le llega ya calculado (en batch) desde afuera.
+    """
     def __init__(self, cam_id: str, src: str):
         self.cam_id = cam_id
         self.src = src
         self.clients: Set[WebSocket] = set()
         self.running = False
-        self.task = None
+        self.cap = None
+        self.is_live_stream = False
+        self.W: int = 0
+        self.H: int = 0
 
         self.win_feats = deque(maxlen=SEQ_LEN)
         self.video_scores = deque(maxlen=VIDEO_MAX_SCORES)
         self.on_state = False
         self.n_predictions = 0
-        self.W: int = 0
-        self.H: int = 0
-
-        # [NUEVO] Contadores para suavizar las alertas
         self.trigger_count = 0
         self.cooldown_count = 0
 
-        # [NUEVO] Memoria de Tracking para 2 personas principales
-        self.target_ids = [None, None]       # Guardará los IDs de tracking de YOLO
-        self.missing_frames = [0, 0]         # Tolerancia: frames que llevan desaparecidos
+        # Tracking online simple por centroide (reemplaza a ByteTrack,
+        # que no se puede batchear entre camaras con persist=True).
+        self.slot_centroids = [None, None]   # ultimo centroide (x,y) por slot
+        self.missing_frames = [0, 0]
 
-    async def start(self):
-        if not self.running:
-            self.running = True
-            self.task = asyncio.create_task(self._loop())
+    # -- ciclo de vida ---------------------------------------------------
+    async def start(self) -> bool:
+        if self.running:
+            return True
+        loop = asyncio.get_event_loop()
+        self.cap = await loop.run_in_executor(_executor, self._open_capture)
+        if self.cap is None:
+            await self._broadcast({"type": "error", "msg": "No se pudo abrir la fuente de video"})
+            return False
+        self.running = True
+        return True
+
+    async def stop(self):
+        self.running = False
+        cap = self.cap
+        self.cap = None
+        if cap is not None:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_executor, cap.release)
 
     def _open_capture(self):
         src = self.src
         is_network_stream = False
         self.is_live_stream = False
 
-        # --- LÓGICA DE YOUTUBE ---
+        # --- LOGICA DE YOUTUBE ---
         if isinstance(src, str) and ("youtube.com" in src or "youtu.be" in src):
             log.info(f"Detectado YouTube: {src}. Extrayendo stream...")
             try:
@@ -297,17 +320,16 @@ class CameraWorker:
                     src = info['url']
                     self.is_live_stream = bool(info.get('is_live'))
                     is_network_stream = True
-                    log.info(f"URL extraída OK. is_live={self.is_live_stream}")
+                    log.info(f"URL extraida OK. is_live={self.is_live_stream}")
             except Exception as e:
                 log.error(f"Error extrayendo URL de YouTube: {e}")
                 return None
 
         target_src = int(src) if str(src).isdigit() else src
-        if isinstance(target_src, str) and (target_src.startswith("http") or  target_src.startswith("rtsp")):
+        if isinstance(target_src, str) and (target_src.startswith("http") or target_src.startswith("rtsp")):
             is_network_stream = True
             os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "10000"
 
-        # --- SELECCIÓN DE LECTOR ---
         if is_network_stream:
             log.info("Usando RealTimeVideoReader (0 lag).")
             cap = RealTimeVideoReader(target_src)
@@ -323,186 +345,127 @@ class CameraWorker:
         self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
 
-    def _grab_and_infer(self, cap) -> dict | None:
-        try:
-            ok, frame = cap.read()
-            if not ok:
-                # Live real de YouTube o RTSP: no hay "frame 0", se acabó de verdad.
-                if getattr(self, "is_live_stream", False):
-                    log.warning("Live stream finalizado/desconectado.")
-                    return None
-                # Video pregrabado (local o URL de YouTube normal): loop infinito.
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = cap.read()
-                if not ok:
-                    return None
-
-            # Cargamos los modelos (solo lo hace la primera vez)
-            keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker = get_artifacts()
-
-            # Override en caliente desde /threshold/set
-            if THR_ON_RUNTIME is not None:
-                thr_on = THR_ON_RUNTIME
-            if THR_OFF_RUNTIME is not None:
-                thr_off = THR_OFF_RUNTIME
-
-            res = pose.track(frame, imgsz=IMGSZ, conf=CONF_POSE, iou=IOU_POSE, 
-                             persist=True, tracker="bytetrack.yaml", verbose=False)[0]
-
-            # Inicializamos un array vacío para exactamente 2 personas (Top-2)
-            kps_f = np.zeros((2, 17, 3), dtype=np.float32)
-
-            if res.keypoints is not None and res.boxes is not None and res.boxes.id is not None:
-                xy = res.keypoints.xy.cpu().numpy()
-                c  = res.keypoints.conf.cpu().numpy()
-                ids = res.boxes.id.int().cpu().numpy()   # IDs únicos que da el tracker
-                confs = c.mean(axis=1)                   # Confianza media del esqueleto
-                
-                # 2. Verificar si nuestros objetivos actuales siguen en pantalla
-                for i in range(2):
-                    if self.target_ids[i] is not None:
-                        if self.target_ids[i] not in ids:
-                            # Se perdió de vista. Le damos 15 frames (~0.5s) de tolerancia antes de olvidarlo
-                            self.missing_frames[i] += 1
-                            if self.missing_frames[i] > 15:
-                                self.target_ids[i] = None
-                        else:
-                            self.missing_frames[i] = 0 # Lo vimos, reseteamos tolerancia
-                
-                # 3. Asignar nuevos objetivos si hay "huecos" libres
-                # Priorizamos a las personas con mayor confianza (ej: > 0.70)
-                available_indices = np.argsort(-confs) 
-                for idx in available_indices:
-                    current_id = ids[idx]
-                    current_conf = confs[idx]
-
-                    if current_id in self.target_ids:
-                        continue # Ya lo estamos trackeando
-                    
-                    # Umbral del 0.70 que mencionaste para decir "esto sí es una persona firme"
-                    if current_conf > 0.70:
-                        if self.target_ids[0] is None:
-                            self.target_ids[0] = current_id
-                            self.missing_frames[0] = 0
-                        elif self.target_ids[1] is None:
-                            self.target_ids[1] = current_id
-                            self.missing_frames[1] = 0
-
-                # 4. Extraer los keypoints en el ORDEN ESTRICTO de target_ids
-                for i in range(2):
-                    t_id = self.target_ids[i]
-                    if t_id is not None and t_id in ids:
-                        # Buscamos en qué índice de la salida actual de YOLO está nuestro actor
-                        idx_yolo = np.where(ids == t_id)[0][0]
-                        kps_f[i] = np.concatenate([xy[idx_yolo], c[idx_yolo, ..., None]], axis=-1)
-            
-            feat = pool_frame_to_110(kps_f, self.W, self.H, is_tracked=True)
-            self.win_feats.append(feat)
-
-            p_win, p_vid = 0.0, 0.0
-
-            if len(self.win_feats) == SEQ_LEN:
-                Xw = smooth_window(np.stack(self.win_feats))
-                
-                p_win = predict_window(Xw, keras_model, mu, sd,
-                        lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
-                self.n_predictions += 1
-                if self.n_predictions > WARMUP_PREDS:
-                    self.video_scores.append(p_win)
-                    p_vid = pool_scores(list(self.video_scores), pool=POOL_METHOD, topk_frac=TOPK_FRAC)
-
-            fired_alert = False
-            if self.n_predictions > WARMUP_PREDS:
-                
-                # 1. Si el score supera el umbral, empezamos a contar
-                if p_vid >= thr_on:
-                    self.trigger_count += 1
-                    self.cooldown_count = 0 # Se cancela el enfriamiento
-                    
-                    # Dispara la alerta solo si lleva 15 frames seguidos (~0.5 segundos) por encima del umbral
-                    if not self.on_state and self.trigger_count >= 15:
-                        self.on_state = True
-                        fired_alert = True
-                
-                # 2. Si el score baja del umbral de apagado, empezamos a enfriar
-                elif p_vid <= thr_off:
-                    self.cooldown_count += 1
-                    self.trigger_count = 0 # Se cancela el disparo
-                    
-                    # Apaga la alerta solo si lleva 30 frames seguidos (~1 segundo) en calma
-                    if self.on_state and self.cooldown_count >= 30:
-                        self.on_state = False
-                
-                # 3. Zona muerta (entre thr_off y thr_on)
-                else:
-                    # En la zona muerta no disparamos ni apagamos, pero reiniciamos contadores
-                    self.trigger_count = 0
-                    self.cooldown_count = 0
-
-            try:
-                shown = res.plot() if DRAW_OVERLAY else frame
-            except Exception:
-                shown = frame
-            
-            _, buf = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 65])
-            jpg = base64.b64encode(buf).decode()
-
-            now = time.time()
-            return {
-                "p_win": p_win,
-                "p_vid": p_vid,
-                "on": self.on_state,
-                "ts": now,
-                "jpg_b64": jpg,
-                "fired_alert": fired_alert,
-            }
-        
-        except Exception as e:
-            # Si hay un error (ej. falta un modelo), ahora sí nos lo dirá en la terminal
-            print(f"\n[ERROR CRITICO] Algo falló procesando el frame: {e}\n")
+    # -- lectura (llamada por el scheduler, dentro del executor) --------
+    def _read_frame_blocking(self):
+        if self.cap is None:
             return None
+        ok, frame = self.cap.read()
+        if not ok:
+            # Live real (YouTube live / RTSP): si se corta, se acabo de verdad.
+            if self.is_live_stream:
+                return None
+            # Video pregrabado: loop infinito.
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.cap.read()
+            if not ok:
+                return None
+        return frame
 
-    async def _loop(self):
-        loop = asyncio.get_event_loop()
+    # -- postprocesamiento de UN resultado de YOLO -----------------------
+    def process_result(self, res, frame) -> dict:
+        keras_model, mu, sd, thr_on, thr_off, lgbm, _pose, stacker = get_artifacts()
 
-        cap = await loop.run_in_executor(_executor, self._open_capture)
-        if cap is None:
-            await self._broadcast({"type": "error", "msg": "No se pudo abrir la fuente de video"})
-            self.running = False
-            return
+        if THR_ON_RUNTIME is not None:
+            thr_on = THR_ON_RUNTIME
+        if THR_OFF_RUNTIME is not None:
+            thr_off = THR_OFF_RUNTIME
+
+        kps_f = np.zeros((2, 17, 3), dtype=np.float32)
+
+        if res.keypoints is not None and res.keypoints.xy is not None and res.keypoints.xy.shape[0] > 0:
+            xy = res.keypoints.xy.cpu().numpy()  # (N,17,2)
+            c = res.keypoints.conf
+            c = c.cpu().numpy() if c is not None else np.ones(xy.shape[:2], dtype=np.float32)
+            confs = c.mean(axis=1)
+
+            def centroid(i):
+                valid = c[i] > 0.1
+                if not valid.any():
+                    return None
+                return xy[i, valid].mean(axis=0)
+
+            det_centroids = [centroid(i) for i in range(xy.shape[0])]
+            used = set()
+
+            # 1) Mantener cada slot con la deteccion mas cercana a su ultimo centroide
+            for slot in range(2):
+                if self.slot_centroids[slot] is None:
+                    continue
+                best_i, best_d = -1, 1e9
+                for i, cen in enumerate(det_centroids):
+                    if i in used or cen is None:
+                        continue
+                    d = float(np.linalg.norm(cen - self.slot_centroids[slot]))
+                    if d < best_d:
+                        best_d, best_i = d, i
+                if best_i != -1 and best_d < TRACK_DIST_PX:
+                    kps_f[slot] = np.concatenate([xy[best_i], c[best_i, ..., None]], axis=-1)
+                    self.slot_centroids[slot] = det_centroids[best_i]
+                    self.missing_frames[slot] = 0
+                    used.add(best_i)
+                else:
+                    self.missing_frames[slot] += 1
+                    if self.missing_frames[slot] > TRACK_MISSING_TOLERANCE:
+                        self.slot_centroids[slot] = None
+
+            # 2) Ocupar slots libres con detecciones nuevas de alta confianza
+            free_slots = [s for s in range(2) if self.slot_centroids[s] is None]
+            if free_slots:
+                candidates = sorted(
+                    (i for i in range(xy.shape[0]) if i not in used and confs[i] > TRACK_CONF_MIN),
+                    key=lambda i: -confs[i],
+                )
+                for slot, i in zip(free_slots, candidates):
+                    kps_f[slot] = np.concatenate([xy[i], c[i, ..., None]], axis=-1)
+                    self.slot_centroids[slot] = det_centroids[i]
+                    self.missing_frames[slot] = 0
+
+        feat = pool_frame_to_110(kps_f, self.W, self.H, is_tracked=True)
+        self.win_feats.append(feat)
+
+        p_win, p_vid = 0.0, 0.0
+        if len(self.win_feats) == SEQ_LEN:
+            Xw = smooth_window(np.stack(self.win_feats))
+            p_win = predict_window(Xw, keras_model, mu, sd,
+                                   lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
+            self.n_predictions += 1
+            if self.n_predictions > WARMUP_PREDS:
+                self.video_scores.append(p_win)
+                p_vid = pool_scores(list(self.video_scores), pool=POOL_METHOD, topk_frac=TOPK_FRAC)
+
+        fired_alert = False
+        if self.n_predictions > WARMUP_PREDS:
+            if p_vid >= thr_on:
+                self.trigger_count += 1
+                self.cooldown_count = 0
+                if not self.on_state and self.trigger_count >= 15:
+                    self.on_state = True
+                    fired_alert = True
+            elif p_vid <= thr_off:
+                self.cooldown_count += 1
+                self.trigger_count = 0
+                if self.on_state and self.cooldown_count >= 30:
+                    self.on_state = False
+            else:
+                self.trigger_count = 0
+                self.cooldown_count = 0
 
         try:
-            while self.running and self.clients:
-                result = await loop.run_in_executor(_executor, self._grab_and_infer, cap)
-                
-                if result is None:
-                    await self._broadcast({"type": "error", "msg": "Fin del stream"})
-                    break
+            shown = res.plot() if DRAW_OVERLAY else frame
+        except Exception:
+            shown = frame
 
-                if result["fired_alert"]:
-                    await self._broadcast({
-                        "type": "alert",
-                        "cam_id": self.cam_id,
-                        "prob": result["p_vid"],
-                        "ts": result["ts"],
-                    })
+        _, buf = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        jpg = base64.b64encode(buf).decode()
 
-                await self._broadcast({
-                    "type": "frame",
-                    "cam_id": self.cam_id,
-                    "p_win": result["p_win"],
-                    "p_vid": result["p_vid"],
-                    "on": result["on"],
-                    "ts": result["ts"],
-                    "jpg_b64": result["jpg_b64"],
-                })
-
-                # MAGIA 2: Frenamos el servidor 0.03 segundos para que vaya a 30 FPS.
-                # ¡Esto evita que el navegador colapse y quite la pantalla negra!
-                await asyncio.sleep(INFER_SLEEP)
-        finally:
-            await loop.run_in_executor(_executor, cap.release)
-            self.running = False
+        return {
+            "p_win": p_win,
+            "p_vid": p_vid,
+            "on": self.on_state,
+            "ts": time.time(),
+            "jpg_b64": jpg,
+            "fired_alert": fired_alert,
+        }
 
     async def _broadcast(self, msg: dict):
         dead = []
@@ -518,6 +481,105 @@ class CameraWorker:
 # ── WebSocket endpoint ────────────────────────────────────
 WORKERS: dict[str, CameraWorker] = {}
 
+# ==========================================================
+# SCHEDULER GLOBAL (un solo loop batchea TODAS las camaras)
+# ==========================================================
+class InferenceScheduler:
+    def __init__(self):
+        self.running = False
+        self.task = None
+
+    async def start(self):
+        if not self.running:
+            self.running = True
+            self.task = asyncio.create_task(self._loop())
+
+    async def _loop(self):
+        global LAST_TICK_MS
+        loop = asyncio.get_event_loop()
+        while self.running:
+            t0 = time.time()
+            try:
+                await self._tick(loop)
+            except Exception as e:
+                log.error(f"[scheduler] tick fallo: {e}")
+
+            elapsed = time.time() - t0
+            LAST_TICK_MS = elapsed * 1000
+            if elapsed > INFER_SLEEP * 1.5:
+                log.warning(
+                    f"[scheduler] tick={elapsed*1000:.0f}ms > "
+                    f"budget={INFER_SLEEP*1000:.0f}ms (bajale camaras o subile TARGET_FPS)"
+                )
+            await asyncio.sleep(max(0.0, INFER_SLEEP - elapsed))
+
+    async def _tick(self, loop):
+        active = [(cid, w) for cid, w in list(WORKERS.items())
+                 if w.running and w.clients and w.cap is not None]
+        if not active:
+            return
+
+        # ── Fase 1: lectura de frames EN PARALELO ──
+        read_tasks = [loop.run_in_executor(_executor, w._read_frame_blocking)
+                     for _, w in active]
+        frames_raw = await asyncio.gather(*read_tasks)
+
+        dead  = [(cid, w) for (cid, w), f in zip(active, frames_raw) if f is None]
+        valid = [(cid, w, f) for (cid, w), f in zip(active, frames_raw) if f is not None]
+
+        for cam_id, w in dead:
+            await w._broadcast({"type": "error", "msg": "Fin del stream"})
+            await w.stop()
+
+        if not valid:
+            return
+
+        # ── Fase 2: UNA sola llamada batcheada a la GPU ──
+        _, _, _, _, _, _, pose_model, _ = get_artifacts()
+        frames = [f for _, _, f in valid]
+
+        def run_batch():
+            use_half = next(pose_model.model.parameters()).is_cuda
+            return pose_model.predict(
+                frames, imgsz=IMGSZ, conf=CONF_POSE, iou=IOU_POSE,
+                verbose=False, half=use_half,
+            )
+
+        results = await loop.run_in_executor(_executor, run_batch)
+
+        # ── Fase 3: postprocesamiento (LSTM + JPEG) EN PARALELO ──
+        post_tasks = [
+            loop.run_in_executor(_executor, w.process_result, res, frame)
+            for (cam_id, w, frame), res in zip(valid, results)
+        ]
+        post_results = await asyncio.gather(*post_tasks)
+
+        # ── Fase 4: broadcast ──
+        for (cam_id, w, _), result in zip(valid, post_results):
+            if result["fired_alert"]:
+                await w._broadcast({
+                    "type": "alert",
+                    "cam_id": cam_id,
+                    "prob": result["p_vid"],
+                    "ts": result["ts"],
+                })
+
+            await w._broadcast({
+                "type": "frame",
+                "cam_id": cam_id,
+                "p_win": result["p_win"],
+                "p_vid": result["p_vid"],
+                "on": result["on"],
+                "ts": result["ts"],
+                "jpg_b64": result["jpg_b64"],
+            })
+
+SCHEDULER = InferenceScheduler()
+
+
+@app.on_event("startup")
+async def _on_startup():
+    await SCHEDULER.start()
 
 @app.websocket("/ws/stream/{cam_id}")
 async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
@@ -536,7 +598,10 @@ async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
     if not worker or not worker.running:
         worker = CameraWorker(cam_id, src)
         WORKERS[cam_id] = worker
-        await worker.start()
+        ok = await worker.start()
+        if not ok:
+            await ws.close()
+            return
 
     worker.clients.add(ws)
     try:
@@ -544,3 +609,5 @@ async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
             await ws.receive_text()
     except WebSocketDisconnect:
         worker.clients.discard(ws)
+        if not worker.clients:
+            await worker.stop()

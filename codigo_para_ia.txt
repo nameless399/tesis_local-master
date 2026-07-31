@@ -6892,424 +6892,6 @@ class CameraAction(Base):
 
 
 ================================================================================
-Archivo: app/pipeline.py
-================================================================================
-
-# app/pipeline.py  –  Funciones compartidas del pipeline de pose-estimation
-#
-# Centraliza: pool_frame_to_51, frame_visible, pool_scores, featurize_T51,
-#             norm_apply y predict_window.  Usado por server.py, inferencia_video.py
-#             y train_lgbm.py para evitar divergencias.
-
-import json
-import os
-from pathlib import Path
-from typing import List
-
-import numpy as np
-import joblib
-
-def smooth_window(Xw: np.ndarray, window_size: int = 3) -> np.ndarray:
-    """Aplica una media móvil para quitar el temblor del esqueleto de YOLO"""
-    pad_size = window_size // 2
-    # Rellenamos los bordes para no perder frames
-    Xw_padded = np.pad(Xw, ((pad_size, pad_size), (0, 0)), mode='edge')
-    smoothed = np.zeros_like(Xw)
-    for i in range(Xw.shape[0]):
-        smoothed[i] = np.mean(Xw_padded[i : i+window_size], axis=0)
-    return smoothed
-# ══════════════════════════════════════════════════════════
-# Constantes por defecto
-# ══════════════════════════════════════════════════════════
-SEQ_LEN      = 32
-CONF_MIN     = 0.10
-MIN_VIS_FRAC = 0.30
-HYST_GAP     = 0.10
-N_FEATURES_V2 = 110   # 2 personas × 51 + 8 interacción
-
-# --- Constantes para V2 ---
-N_PERSONS    = 2        
-N_JOINTS     = 17
-N_INTER      = 8        
-N_FEATURES   = N_PERSONS * N_JOINTS * 3 + N_INTER 
-
-_NOSE                    = 0
-_WRIST_L, _WRIST_R       = 9, 10
-_HIP_L,   _HIP_R         = 11, 12
-_SHOULDER_L, _SHOULDER_R = 5, 6
-
-def frame_visible_v2(kps_f: np.ndarray, conf_min: float = 0.10) -> bool:
-    if kps_f is None or kps_f.size == 0:
-        return False
-    return bool((np.nan_to_num(kps_f[..., 2], nan=0.0) >= conf_min).any())
-
-def pool_frame_to_110(kps_f: np.ndarray | None, W: int, H: int,  is_tracked: bool = False) -> np.ndarray:
-    """Extrae features de 2 personas + distancias de interacción para el modelo V2"""
-    out = np.zeros(N_FEATURES, dtype=np.float32)
-    if kps_f is None or kps_f.size == 0:
-        return out
-
-    K = kps_f.shape[0]
-
-    # --- ¡EL SWITCH MÁGICO! ---
-    if is_tracked:
-        # Si ya vienen trackeados (por YOLO en vivo o por el Offline Tracker), mantenemos su orden real
-        order = np.arange(min(K, N_PERSONS))
-    else:
-        # Comportamiento antiguo: Si no están trackeados, ordenamos por el que tenga más confianza
-        confs = np.nan_to_num(kps_f[..., 2], nan=0.0).mean(axis=1)
-        order = np.argsort(-confs)
-
-    p_data = []
-    for pi in range(N_PERSONS):
-        base = pi * N_JOINTS * 3
-        kp   = np.zeros((N_JOINTS, 3), dtype=np.float32)
-        
-        # Verificamos que el índice exista en nuestro 'order'
-        if pi < len(order) and order[pi] < K:
-            raw = kps_f[order[pi]]
-            c   = np.nan_to_num(raw[:, 2], nan=0.0)
-            
-            # --- MEJORA: CENTRADO EN EL CUERPO ---
-            valid = c > 0
-            cx = raw[valid, 0].mean() if valid.any() else 0.0
-            cy = raw[valid, 1].mean() if valid.any() else 0.0
-
-            for j in range(N_JOINTS):
-                if c[j] > 0 and np.isfinite(raw[j, 0]) and np.isfinite(raw[j, 1]):
-                    # Restamos el centro y sumamos 0.5 para mantenerlo en rango [0, 1]
-                    kp[j, 0] = np.clip(((raw[j, 0] - cx) / max(W, 1)) + 0.5, 0.0, 1.0)
-                    kp[j, 1] = np.clip(((raw[j, 1] - cy) / max(H, 1)) + 0.5, 0.0, 1.0)
-                    kp[j, 2] = np.clip(float(c[j]), 0.0, 1.0)
-        
-        out[base : base + N_JOINTS * 3] = kp.reshape(-1)
-        p_data.append(kp)
-
-    off    = N_PERSONS * N_JOINTS * 3
-    p1, p2 = p_data[0], p_data[1]
-    c1, c2 = p1[:, 2], p2[:, 2]
-    p1_ok  = c1.mean() > 0.10
-    p2_ok  = c2.mean() > 0.10
-
-    vis_total = ((c1 > 0.1).sum() + (c2 > 0.1).sum()) / (N_JOINTS * N_PERSONS)
-    out[off + 0] = float(vis_total)
-
-    if p1_ok:
-        out[off + 1] = float((c1[_WRIST_L] + c1[_WRIST_R]) / 2.0)
-
-    if p1_ok and p2_ok:
-        w1  = c1 + 1e-6
-        w2  = c2 + 1e-6
-        cm1 = np.array([np.average(p1[:, 0], weights=w1),
-                         np.average(p1[:, 1], weights=w1)])
-        cm2 = np.array([np.average(p2[:, 0], weights=w2), 
-                        np.average(p2[:, 1], weights=w2)])
-
-        out[off + 2] = float(np.linalg.norm(cm1 - cm2))
-
-        def jdist(j_a, pa, j_b, pb):
-            a, b = pa[j_a], pb[j_b]
-            if a[2] > 0.1 and b[2] > 0.1:
-                return float(np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2))
-            return 0.0
-
-        out[off + 3] = jdist(_WRIST_R, p1, _NOSE,   p2)
-        out[off + 4] = jdist(_WRIST_R, p2, _NOSE,   p1)
-        out[off + 5] = jdist(_WRIST_L, p1, _NOSE,   p2)
-        out[off + 6] = jdist(_WRIST_R, p1, _HIP_L,  p2)
-
-        def tilt(kp):
-            sx = kp[_SHOULDER_R, 0] - kp[_HIP_R, 0]
-            sy = kp[_SHOULDER_R, 1] - kp[_HIP_R, 1]
-            return float(np.arctan2(sy, sx + 1e-6) / np.pi)
-
-        out[off + 7] = abs(tilt(p1) - tilt(p2))
-
-    return out
-
-# --- arriba Constantes para V2 arriba ---
-
-# --- Indices COCO de joints ---
-#  0=nose  1=L_eye  2=R_eye  3=L_ear  4=R_ear
-#  5=L_shoulder  6=R_shoulder  7=L_elbow  8=R_elbow
-#  9=L_wrist  10=R_wrist  11=L_hip  12=R_hip
-# 13=L_knee  14=R_knee  15=L_ankle  16=R_ankle
-
-# Pares de distancias
-PAIR_DISTS = [
-    (5, 6),    # hombro-hombro
-    (9, 10),   # muñeca-muñeca
-    (0, 9),    # nariz-muñeca_izq  (golpe)
-    (0, 10),   # nariz-muñeca_der  (golpe)
-    (11, 12),  # cadera-cadera
-    (15, 16),  # tobillo-tobillo
-    (9, 12),   # muñeca_izq-cadera_der  (cruce)
-    (10, 11),  # muñeca_der-cadera_izq  (cruce)
-    (5, 11),   # hombro_izq-cadera_izq  (torso)
-    (6, 12),   # hombro_der-cadera_der  (torso)
-]
-
-# Triplets para angulos articulares: (A, vertice, B)
-ANGLE_JOINTS = [
-    (5, 7, 9),    # hombro_izq -> codo_izq -> muñeca_izq
-    (6, 8, 10),   # hombro_der -> codo_der -> muñeca_der
-    (11, 13, 15),  # cadera_izq -> rodilla_izq -> tobillo_izq
-    (12, 14, 16),  # cadera_der -> rodilla_der -> tobillo_der
-    (7, 5, 11),   # codo_izq -> hombro_izq -> cadera_izq
-    (8, 6, 12),   # codo_der -> hombro_der -> cadera_der
-    (5, 0, 6),    # hombro_izq -> nariz -> hombro_der  (inclinacion cabeza)
-]
-
-
-# ══════════════════════════════════════════════════════════
-# Utilidades de frame
-# ══════════════════════════════════════════════════════════
-def pool_frame_to_51(kps_f: np.ndarray | None, W: int, H: int) -> np.ndarray:
-    """(P,17,3) -> (51,)  pooling por joint con mayor confianza, normalizado por W,H."""
-    out = np.zeros((17, 3), dtype=np.float32)
-    if kps_f is None or kps_f.size == 0:
-        return out.reshape(-1)
-    conf_j = np.nan_to_num(kps_f[..., 2], nan=0.0)
-    for j in range(17):
-        idx = int(np.argmax(conf_j[:, j]))
-        c = conf_j[idx, j]
-        if c > 0:
-            x, y, _ = kps_f[idx, j, :]
-            if np.isfinite(x) and np.isfinite(y):
-                out[j, 0] = np.clip(x / max(W, 1), 0.0, 1.0)
-                out[j, 1] = np.clip(y / max(H, 1), 0.0, 1.0)
-                out[j, 2] = float(np.clip(c, 0.0, 1.0))
-    return out.reshape(-1)
-
-
-def frame_visible(kps_f: np.ndarray | None, conf_min: float = CONF_MIN) -> bool:
-    if kps_f is None or kps_f.size == 0:
-        return False
-    conf = np.nan_to_num(kps_f[..., 2], nan=0.0)
-    return bool((conf >= conf_min).any())
-
-
-# ══════════════════════════════════════════════════════════
-# Pooling de scores a nivel video
-# ══════════════════════════════════════════════════════════
-def pool_scores(scores: List[float], pool: str = "topk", topk_frac: float = 0.2) -> float:
-    if not scores:
-        return 0.0
-    arr = np.asarray(scores, dtype=np.float32)
-    if pool == "max":
-        return float(arr.max())
-    if pool == "mean":
-        return float(arr.mean())
-    k = max(1, int(len(arr) * topk_frac))
-    return float(np.partition(arr, -k)[-k:].mean())
-
-
-# ══════════════════════════════════════════════════════════
-# Featurizador tabular para LGBM  (DEBE coincidir con train_lgbm.py)
-# ══════════════════════════════════════════════════════════
-def _stats(a: np.ndarray) -> np.ndarray:
-    """mean, std, min, max por columna."""
-    return np.concatenate([a.mean(0), a.std(0), a.min(0), a.max(0)], axis=0)
-
-
-def _angle_between(a: np.ndarray, vertex: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Angulo en radianes en el vertice, para cada frame.  (T,)"""
-    va = a - vertex  # (T, 2)
-    vb = b - vertex
-    cos = np.sum(va * vb, axis=1) / (np.linalg.norm(va, axis=1) * np.linalg.norm(vb, axis=1) + 1e-8)
-    return np.arccos(np.clip(cos, -1.0, 1.0))
-
-
-def featurize_T51(X_win: np.ndarray) -> np.ndarray:
-    """
-    Desde una ventana (T, 51) genera el vector tabular para LGBM.
-
-    Bloques de features:
-      1. Stats x, y, velocidad, confianza  (4 * 4stats * 17joints = 272)
-      2. Aceleracion stats                  (4stats * 17joints = 68)
-      3. Distancias entre pares             (10 pares * 2 = 20)
-      4. Angulos articulares stats          (7 angulos * 4stats = 28)
-
-    Total: 272 + 68 + 20 + 28 = 388 features
-
-    Returns: (1, D) array listo para predict.
-    """
-    T = X_win.shape[0]
-    xyz = X_win.reshape(T, 17, 3)
-    x, y, c = xyz[..., 0], xyz[..., 1], xyz[..., 2]  # (T, 17) cada uno
-
-    # --- Velocidades (1ra derivada) ---
-    dx = np.diff(x, axis=0, prepend=x[0:1])
-    dy = np.diff(y, axis=0, prepend=y[0:1])
-    v = np.sqrt(dx * dx + dy * dy)
-
-    # --- Aceleracion (2da derivada, magnitud) ---
-    ddx = np.diff(dx, axis=0, prepend=dx[0:1])
-    ddy = np.diff(dy, axis=0, prepend=dy[0:1])
-    acc = np.sqrt(ddx * ddx + ddy * ddy)
-
-    # --- Stats basicas ---
-    Fx = _stats(x)
-    Fy = _stats(y)
-    Fv = _stats(v)
-    Fc = _stats(c)
-    Fa = _stats(acc)
-
-    # --- Distancias entre pares ---
-    D = []
-    for (i, j) in PAIR_DISTS:
-        dij = np.sqrt((x[:, i] - x[:, j]) ** 2 + (y[:, i] - y[:, j]) ** 2)
-        D += [dij.mean(), dij.std()]
-    D = np.array(D, dtype=np.float32)
-
-    # --- Angulos articulares ---
-    angles = []
-    for (a_idx, v_idx, b_idx) in ANGLE_JOINTS:
-        pt_a = np.stack([x[:, a_idx], y[:, a_idx]], axis=1)    # (T, 2)
-        pt_v = np.stack([x[:, v_idx], y[:, v_idx]], axis=1)
-        pt_b = np.stack([x[:, b_idx], y[:, b_idx]], axis=1)
-        ang = _angle_between(pt_a, pt_v, pt_b)                 # (T,)
-        angles.append(ang)
-    angles = np.stack(angles, axis=1)  # (T, 7)
-    Fang = _stats(angles)
-
-    feat = np.concatenate([Fx, Fy, Fv, Fc, Fa, D, Fang], axis=0).astype(np.float32)
-    return feat.reshape(1, -1)
-
-
-# ══════════════════════════════════════════════════════════
-# Normalización para el modelo Keras (LSTM)
-# ══════════════════════════════════════════════════════════
-def norm_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
-    """X: (1, T, 51) -> normalizado."""
-    T, F = X.shape[1], X.shape[2]
-    X2 = X.reshape(-1, F)
-    Xn = (X2 - mu) / (sd + 1e-6)
-    return Xn.reshape(1, T, F).astype("float32")
-
-
-# ══════════════════════════════════════════════════════════
-# Predicción fusionada  LSTM + LGBM (soporta stacking)
-# ══════════════════════════════════════════════════════════
-def predict_window(Xw: np.ndarray, keras_model, mu, sd,
-                   lgbm=None, fusion_w: float = 0.5,
-                   stacker=None) -> float:
-    """
-    Xw: (T, 51)
-    fusion_w: peso para fusion lineal (ignorado si stacker != None)
-    stacker:  modelo meta-learner (LogisticRegression) entrenado sobre [p_lstm, p_lgbm]
-    """
-    # --- Keras (LSTM) ---
-    X = Xw[np.newaxis, ...]
-    X = norm_apply(X, mu, sd)
-    p_keras = float(keras_model.predict(X, verbose=0).ravel()[0])
-
-    if lgbm is None or fusion_w <= 0.0:
-        return np.clip(p_keras, 0.0, 1.0)
-
-    # --- LGBM ---
-    feat = featurize_T51(Xw)
-    expected = getattr(lgbm, "n_features_in_", None)
-    if expected is not None and feat.shape[1] != expected:
-        return np.clip(p_keras, 0.0, 1.0)
-
-    try:
-        p_lgbm = float(lgbm.predict_proba(feat)[:, 1][0])
-    except Exception:
-        return np.clip(p_keras, 0.0, 1.0)
-
-    # --- Fusion ---
-    if stacker is not None:
-        try:
-            meta_feat = np.array([[p_keras, p_lgbm]], dtype=np.float32)
-            p_fused = float(stacker.predict_proba(meta_feat)[:, 1][0])
-            return np.clip(p_fused, 0.0, 1.0)
-        except Exception:
-            pass
-
-    # Fallback: fusion lineal
-    return float(np.clip((1.0 - fusion_w) * p_keras + fusion_w * p_lgbm, 0.0, 1.0))
-
-
-# ══════════════════════════════════════════════════════════
-# Carga de artefactos (modelos + stats + threshold + stacker)
-# ══════════════════════════════════════════════════════════
-def load_artifacts(models_dir: str | Path, pose_weights: str):
-    """
-    Retorna: (keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker)
-    """
-    import tensorflow as tf
-    tf.config.set_visible_devices([], 'GPU') 
-
-    from keras.models import load_model
-    from ultralytics import YOLO
-    import torch
-
-    models_dir = Path(models_dir)
-
-    keras_path  = models_dir / "v2_bilstm_attention.keras"
-    stats_path  = models_dir / "v2_norm_stats.npz"
-    thr_path    = models_dir / "v2_threshold.json"
-    lgbm_path   = models_dir / "lgbm_model.pkl"
-    stacker_path = models_dir / "stacker.pkl"
-
-    keras_model = load_model(str(keras_path), compile=False)
-
-    stats = np.load(stats_path)
-    mu = stats["mean"].astype("float32")
-    sd = stats["std"].astype("float32")
-
-    thr_on = 0.5
-    if thr_path.exists():
-        thr_on = float(json.loads(thr_path.read_text(encoding="utf-8")).get("best_threshold", 0.5))
-
-    # Override opcional por env var (sin tocar el JSON del modelo).
-    env_thr_on = os.getenv("THR_ON")
-    if env_thr_on:
-        try:
-            thr_on = float(env_thr_on)
-            print(f"[BOOT] THR_ON sobreescrito por env var -> {thr_on:.2f}")
-        except ValueError:
-            print(f"[BOOT] THR_ON env var invalido: {env_thr_on!r}")
-
-    thr_off = max(0.0, thr_on - HYST_GAP)
-    env_thr_off = os.getenv("THR_OFF")
-    if env_thr_off:
-        try:
-            thr_off = float(env_thr_off)
-            print(f"[BOOT] THR_OFF sobreescrito por env var -> {thr_off:.2f}")
-        except ValueError:
-            print(f"[BOOT] THR_OFF env var invalido: {env_thr_off!r}")
-
-    lgbm = None
-    if lgbm_path.exists():
-        try:
-            lgbm = joblib.load(lgbm_path)
-            print(f"[BOOT] LGBM cargado desde {lgbm_path}")
-        except Exception as e:
-            print(f"[BOOT] LGBM falló al cargar ({e}), continuo sin LGBM")
-
-    stacker = None
-    if stacker_path.exists():
-        try:
-            stacker = joblib.load(stacker_path)
-            print(f"[BOOT] Stacker cargado desde {stacker_path}")
-        except Exception as e:
-            print(f"[BOOT] Stacker falló ({e}), usando fusion lineal")
-
-    pose = YOLO(pose_weights)
-    if torch.cuda.is_available():
-        pose.to("cuda")
-    print("TF ve GPU:", tf.config.list_physical_devices('GPU'))
-    print("Torch ve GPU:", torch.cuda.is_available())
-    print("YOLO device:", pose.device)
-    print(f"[BOOT] Keras={keras_path.name} | THR_ON={thr_on:.2f} THR_OFF={thr_off:.2f}"
-          f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}")
-
-    return keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker
-
-
-================================================================================
 Archivo: app/schemas.py
 ================================================================================
 
@@ -8481,21 +8063,489 @@ if __name__ == "__main__":
 
 
 ================================================================================
+Archivo: app/cookies.txt
+================================================================================
+
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com	TRUE	/	TRUE	1796170537	SOCS	CAISEwgDEgk5MjY0MTExMjMaAmVuIAEaBgiAo4jRBg
+.youtube.com	TRUE	/	FALSE	1800744960	HSID	AHZ8au6Qnp1OdkUFc
+.youtube.com	TRUE	/	TRUE	1800744960	SSID	AtSuUEUWAKGlUWpV5
+.youtube.com	TRUE	/	FALSE	1800744960	APISID	kF_NYG55z1RHUJq_/ABod86OrDdY7DGRZR
+.youtube.com	TRUE	/	TRUE	1800744960	SAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
+.youtube.com	TRUE	/	TRUE	1797958274	LOGIN_INFO	AFmmF2swRAIgKG3Yat1zohGzQfz7KJwGgcjmrFuTp9GWnQM8iJnY350CIFLxI2MyqfjHD43e6T2BF-EV_CSo9IkjoIYY2c_3ozP6:QUQ3MjNmelFBSGRkZkxkcUFOVHRfcy1sMkY4LU9ZZkJ6TUVkSHNwOG9wNks5NUVmZGk4bnJRRWhiWjBVaTlaLUU3Z2FoRVM5T1NmdFIxVWJDZ0ZWaDN5ZlhLZzZ4V1lpclBURUQ0YlJVV243QkZKLTdrVm83WmloaWktUjVVdUxsa1BpN3FxRnVxUVllWkFCZlZEUzJfMnVadlloMGlXaFp3
+.youtube.com	TRUE	/	FALSE	1800744960	SID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyIEDzczfkbLdnDHbeCWWtawACgYKAXASARYSFQHGX2Miufx6iX5nCkvnvWMoOvOWvhoVAUF8yKq3N8arwSBfajTtfjW4-6-l0076
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuynbIK6didk4IdKYu8EkKDtAACgYKAUkSARYSFQHGX2Mi34A6Tqo0pPmvmefoMoSA5RoVAUF8yKrD1FfsH39FnG-bio3qGddG0076
+.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyl-dP33vjcSJQ8OpKJbIBbAACgYKAWESARYSFQHGX2Mi_KP1IjhvM7hkyInjr69cRhoVAUF8yKqkl5uLA3qPrWoUBx6xuBJm0076
+.youtube.com	TRUE	/	TRUE	1801000432	PREF	f6=40000000&tz=America.Los_Angeles&f7=100&f4=10000
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
+.youtube.com	TRUE	/	FALSE	1801000421	SIDCC	AKEyXzV-11HZf5ttKl-sRnhPwNE--SHpit5asDAaW-Sa0FwtNhWzt2yRqxZEL3bTlg3qsDAFYQ
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDCC	AKEyXzWPKVTLp5KIZ64HeWbzwOv8Pgm4cBxpnBzV_L35xwF4VGgrJgmDLwJ89hiQNS8cAghd
+.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDCC	AKEyXzX-H26VZZ6_9Gy6q2vVZAoj5kw_Gk0rLoeRCr0I-zL6GUIR3mQt0-bNMTkLN9TVx-3A
+.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_INFO1_LIVE	9aBaVg_bbBo
+.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_PRIVACY_METADATA	CgJOTBIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgPw%3D%3D
+.youtube.com	TRUE	/	TRUE	1800917553	__Secure-YNID	20.YT=OnkJTjNMUh1swUHNSuvrxkjCe3-IIRKLJfXKMv9NR9c5fLJfqYt7huabCrxe6_MmVtyr_mch1QYTEyJZwwVEFq8h6Jzbz90tjRhpkLgv7k3F8tIekr7hGdY_9Hd1DeoKFVAUpA2kxFlaEgO3JOPihTKBN5DRWj0_8rut8nvMQpcJW7DOkgubGF38OUFysSo_80UbjdJN9fkzGHsqCzu6M2gIuqOZ-Y3K6KJDZADeD0qyinU6t-4XctD1w_hJtRZI6FuJuU0yoFCChPvxNDrWROw-HuefDx3j6vLDPtUsVzbA9-4gCd7I9_9MOs9vufr27dK246MIZEZnY-0Wq06lcw
+.youtube.com	TRUE	/	TRUE	1800917553	__Secure-ROLLOUT_TOKEN	CPHZzYf6up3U4wEQj9y8tozElAMYno3z8_z4lQM%3D
+.youtube.com	TRUE	/	TRUE	0	YSC	oq25gmrF4PU
+
+
+================================================================================
+Archivo: app/pipeline.py
+================================================================================
+
+# app/pipeline.py  –  Funciones compartidas del pipeline de pose-estimation
+#
+# Centraliza: pool_frame_to_51, frame_visible, pool_scores, featurize_T51,
+#             norm_apply y predict_window.  Usado por server.py, inferencia_video.py
+#             y train_lgbm.py para evitar divergencias.
+
+import json
+import os
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import joblib
+
+def smooth_window(Xw: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """Aplica una media móvil para quitar el temblor del esqueleto de YOLO"""
+    pad_size = window_size // 2
+    # Rellenamos los bordes para no perder frames
+    Xw_padded = np.pad(Xw, ((pad_size, pad_size), (0, 0)), mode='edge')
+    smoothed = np.zeros_like(Xw)
+    for i in range(Xw.shape[0]):
+        smoothed[i] = np.mean(Xw_padded[i : i+window_size], axis=0)
+    return smoothed
+# ══════════════════════════════════════════════════════════
+# Constantes por defecto
+# ══════════════════════════════════════════════════════════
+SEQ_LEN      = 32
+CONF_MIN     = 0.10
+MIN_VIS_FRAC = 0.30
+HYST_GAP     = 0.10
+N_FEATURES_V2 = 110   # 2 personas × 51 + 8 interacción
+
+# --- Constantes para V2 ---
+N_PERSONS    = 2        
+N_JOINTS     = 17
+N_INTER      = 8        
+N_FEATURES   = N_PERSONS * N_JOINTS * 3 + N_INTER 
+
+_NOSE                    = 0
+_WRIST_L, _WRIST_R       = 9, 10
+_HIP_L,   _HIP_R         = 11, 12
+_SHOULDER_L, _SHOULDER_R = 5, 6
+
+def frame_visible_v2(kps_f: np.ndarray, conf_min: float = 0.10) -> bool:
+    if kps_f is None or kps_f.size == 0:
+        return False
+    return bool((np.nan_to_num(kps_f[..., 2], nan=0.0) >= conf_min).any())
+
+def pool_frame_to_110(kps_f: np.ndarray | None, W: int, H: int,  is_tracked: bool = False) -> np.ndarray:
+    """Extrae features de 2 personas + distancias de interacción para el modelo V2"""
+    out = np.zeros(N_FEATURES, dtype=np.float32)
+    if kps_f is None or kps_f.size == 0:
+        return out
+
+    K = kps_f.shape[0]
+
+    # --- ¡EL SWITCH MÁGICO! ---
+    if is_tracked:
+        # Si ya vienen trackeados (por YOLO en vivo o por el Offline Tracker), mantenemos su orden real
+        order = np.arange(min(K, N_PERSONS))
+    else:
+        # Comportamiento antiguo: Si no están trackeados, ordenamos por el que tenga más confianza
+        confs = np.nan_to_num(kps_f[..., 2], nan=0.0).mean(axis=1)
+        order = np.argsort(-confs)
+
+    p_data = []
+    for pi in range(N_PERSONS):
+        base = pi * N_JOINTS * 3
+        kp   = np.zeros((N_JOINTS, 3), dtype=np.float32)
+        
+        # Verificamos que el índice exista en nuestro 'order'
+        if pi < len(order) and order[pi] < K:
+            raw = kps_f[order[pi]]
+            c   = np.nan_to_num(raw[:, 2], nan=0.0)
+            
+            # --- MEJORA: CENTRADO EN EL CUERPO ---
+            valid = c > 0
+            cx = raw[valid, 0].mean() if valid.any() else 0.0
+            cy = raw[valid, 1].mean() if valid.any() else 0.0
+
+            for j in range(N_JOINTS):
+                if c[j] > 0 and np.isfinite(raw[j, 0]) and np.isfinite(raw[j, 1]):
+                    # Restamos el centro y sumamos 0.5 para mantenerlo en rango [0, 1]
+                    kp[j, 0] = np.clip(((raw[j, 0] - cx) / max(W, 1)) + 0.5, 0.0, 1.0)
+                    kp[j, 1] = np.clip(((raw[j, 1] - cy) / max(H, 1)) + 0.5, 0.0, 1.0)
+                    kp[j, 2] = np.clip(float(c[j]), 0.0, 1.0)
+        
+        out[base : base + N_JOINTS * 3] = kp.reshape(-1)
+        p_data.append(kp)
+
+    off    = N_PERSONS * N_JOINTS * 3
+    p1, p2 = p_data[0], p_data[1]
+    c1, c2 = p1[:, 2], p2[:, 2]
+    p1_ok  = c1.mean() > 0.10
+    p2_ok  = c2.mean() > 0.10
+
+    vis_total = ((c1 > 0.1).sum() + (c2 > 0.1).sum()) / (N_JOINTS * N_PERSONS)
+    out[off + 0] = float(vis_total)
+
+    if p1_ok:
+        out[off + 1] = float((c1[_WRIST_L] + c1[_WRIST_R]) / 2.0)
+
+    if p1_ok and p2_ok:
+        w1  = c1 + 1e-6
+        w2  = c2 + 1e-6
+        cm1 = np.array([np.average(p1[:, 0], weights=w1),
+                         np.average(p1[:, 1], weights=w1)])
+        cm2 = np.array([np.average(p2[:, 0], weights=w2), 
+                        np.average(p2[:, 1], weights=w2)])
+
+        out[off + 2] = float(np.linalg.norm(cm1 - cm2))
+
+        def jdist(j_a, pa, j_b, pb):
+            a, b = pa[j_a], pb[j_b]
+            if a[2] > 0.1 and b[2] > 0.1:
+                return float(np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2))
+            return 0.0
+
+        out[off + 3] = jdist(_WRIST_R, p1, _NOSE,   p2)
+        out[off + 4] = jdist(_WRIST_R, p2, _NOSE,   p1)
+        out[off + 5] = jdist(_WRIST_L, p1, _NOSE,   p2)
+        out[off + 6] = jdist(_WRIST_R, p1, _HIP_L,  p2)
+
+        def tilt(kp):
+            sx = kp[_SHOULDER_R, 0] - kp[_HIP_R, 0]
+            sy = kp[_SHOULDER_R, 1] - kp[_HIP_R, 1]
+            return float(np.arctan2(sy, sx + 1e-6) / np.pi)
+
+        out[off + 7] = abs(tilt(p1) - tilt(p2))
+
+    return out
+
+# --- arriba Constantes para V2 arriba ---
+
+# --- Indices COCO de joints ---
+#  0=nose  1=L_eye  2=R_eye  3=L_ear  4=R_ear
+#  5=L_shoulder  6=R_shoulder  7=L_elbow  8=R_elbow
+#  9=L_wrist  10=R_wrist  11=L_hip  12=R_hip
+# 13=L_knee  14=R_knee  15=L_ankle  16=R_ankle
+
+# Pares de distancias
+PAIR_DISTS = [
+    (5, 6),    # hombro-hombro
+    (9, 10),   # muñeca-muñeca
+    (0, 9),    # nariz-muñeca_izq  (golpe)
+    (0, 10),   # nariz-muñeca_der  (golpe)
+    (11, 12),  # cadera-cadera
+    (15, 16),  # tobillo-tobillo
+    (9, 12),   # muñeca_izq-cadera_der  (cruce)
+    (10, 11),  # muñeca_der-cadera_izq  (cruce)
+    (5, 11),   # hombro_izq-cadera_izq  (torso)
+    (6, 12),   # hombro_der-cadera_der  (torso)
+]
+
+# Triplets para angulos articulares: (A, vertice, B)
+ANGLE_JOINTS = [
+    (5, 7, 9),    # hombro_izq -> codo_izq -> muñeca_izq
+    (6, 8, 10),   # hombro_der -> codo_der -> muñeca_der
+    (11, 13, 15),  # cadera_izq -> rodilla_izq -> tobillo_izq
+    (12, 14, 16),  # cadera_der -> rodilla_der -> tobillo_der
+    (7, 5, 11),   # codo_izq -> hombro_izq -> cadera_izq
+    (8, 6, 12),   # codo_der -> hombro_der -> cadera_der
+    (5, 0, 6),    # hombro_izq -> nariz -> hombro_der  (inclinacion cabeza)
+]
+
+
+# ══════════════════════════════════════════════════════════
+# Utilidades de frame
+# ══════════════════════════════════════════════════════════
+def pool_frame_to_51(kps_f: np.ndarray | None, W: int, H: int) -> np.ndarray:
+    """(P,17,3) -> (51,)  pooling por joint con mayor confianza, normalizado por W,H."""
+    out = np.zeros((17, 3), dtype=np.float32)
+    if kps_f is None or kps_f.size == 0:
+        return out.reshape(-1)
+    conf_j = np.nan_to_num(kps_f[..., 2], nan=0.0)
+    for j in range(17):
+        idx = int(np.argmax(conf_j[:, j]))
+        c = conf_j[idx, j]
+        if c > 0:
+            x, y, _ = kps_f[idx, j, :]
+            if np.isfinite(x) and np.isfinite(y):
+                out[j, 0] = np.clip(x / max(W, 1), 0.0, 1.0)
+                out[j, 1] = np.clip(y / max(H, 1), 0.0, 1.0)
+                out[j, 2] = float(np.clip(c, 0.0, 1.0))
+    return out.reshape(-1)
+
+
+def frame_visible(kps_f: np.ndarray | None, conf_min: float = CONF_MIN) -> bool:
+    if kps_f is None or kps_f.size == 0:
+        return False
+    conf = np.nan_to_num(kps_f[..., 2], nan=0.0)
+    return bool((conf >= conf_min).any())
+
+
+# ══════════════════════════════════════════════════════════
+# Pooling de scores a nivel video
+# ══════════════════════════════════════════════════════════
+def pool_scores(scores: List[float], pool: str = "topk", topk_frac: float = 0.2) -> float:
+    if not scores:
+        return 0.0
+    arr = np.asarray(scores, dtype=np.float32)
+    if pool == "max":
+        return float(arr.max())
+    if pool == "mean":
+        return float(arr.mean())
+    k = max(1, int(len(arr) * topk_frac))
+    return float(np.partition(arr, -k)[-k:].mean())
+
+
+# ══════════════════════════════════════════════════════════
+# Featurizador tabular para LGBM  (DEBE coincidir con train_lgbm.py)
+# ══════════════════════════════════════════════════════════
+def _stats(a: np.ndarray) -> np.ndarray:
+    """mean, std, min, max por columna."""
+    return np.concatenate([a.mean(0), a.std(0), a.min(0), a.max(0)], axis=0)
+
+
+def _angle_between(a: np.ndarray, vertex: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Angulo en radianes en el vertice, para cada frame.  (T,)"""
+    va = a - vertex  # (T, 2)
+    vb = b - vertex
+    cos = np.sum(va * vb, axis=1) / (np.linalg.norm(va, axis=1) * np.linalg.norm(vb, axis=1) + 1e-8)
+    return np.arccos(np.clip(cos, -1.0, 1.0))
+
+
+def featurize_T51(X_win: np.ndarray) -> np.ndarray:
+    """
+    Desde una ventana (T, 51) genera el vector tabular para LGBM.
+
+    Bloques de features:
+      1. Stats x, y, velocidad, confianza  (4 * 4stats * 17joints = 272)
+      2. Aceleracion stats                  (4stats * 17joints = 68)
+      3. Distancias entre pares             (10 pares * 2 = 20)
+      4. Angulos articulares stats          (7 angulos * 4stats = 28)
+
+    Total: 272 + 68 + 20 + 28 = 388 features
+
+    Returns: (1, D) array listo para predict.
+    """
+    T = X_win.shape[0]
+    xyz = X_win.reshape(T, 17, 3)
+    x, y, c = xyz[..., 0], xyz[..., 1], xyz[..., 2]  # (T, 17) cada uno
+
+    # --- Velocidades (1ra derivada) ---
+    dx = np.diff(x, axis=0, prepend=x[0:1])
+    dy = np.diff(y, axis=0, prepend=y[0:1])
+    v = np.sqrt(dx * dx + dy * dy)
+
+    # --- Aceleracion (2da derivada, magnitud) ---
+    ddx = np.diff(dx, axis=0, prepend=dx[0:1])
+    ddy = np.diff(dy, axis=0, prepend=dy[0:1])
+    acc = np.sqrt(ddx * ddx + ddy * ddy)
+
+    # --- Stats basicas ---
+    Fx = _stats(x)
+    Fy = _stats(y)
+    Fv = _stats(v)
+    Fc = _stats(c)
+    Fa = _stats(acc)
+
+    # --- Distancias entre pares ---
+    D = []
+    for (i, j) in PAIR_DISTS:
+        dij = np.sqrt((x[:, i] - x[:, j]) ** 2 + (y[:, i] - y[:, j]) ** 2)
+        D += [dij.mean(), dij.std()]
+    D = np.array(D, dtype=np.float32)
+
+    # --- Angulos articulares ---
+    angles = []
+    for (a_idx, v_idx, b_idx) in ANGLE_JOINTS:
+        pt_a = np.stack([x[:, a_idx], y[:, a_idx]], axis=1)    # (T, 2)
+        pt_v = np.stack([x[:, v_idx], y[:, v_idx]], axis=1)
+        pt_b = np.stack([x[:, b_idx], y[:, b_idx]], axis=1)
+        ang = _angle_between(pt_a, pt_v, pt_b)                 # (T,)
+        angles.append(ang)
+    angles = np.stack(angles, axis=1)  # (T, 7)
+    Fang = _stats(angles)
+
+    feat = np.concatenate([Fx, Fy, Fv, Fc, Fa, D, Fang], axis=0).astype(np.float32)
+    return feat.reshape(1, -1)
+
+
+# ══════════════════════════════════════════════════════════
+# Normalización para el modelo Keras (LSTM)
+# ══════════════════════════════════════════════════════════
+def norm_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
+    """X: (1, T, 51) -> normalizado."""
+    T, F = X.shape[1], X.shape[2]
+    X2 = X.reshape(-1, F)
+    Xn = (X2 - mu) / (sd + 1e-6)
+    return Xn.reshape(1, T, F).astype("float32")
+
+
+# ══════════════════════════════════════════════════════════
+# Predicción fusionada  LSTM + LGBM (soporta stacking)
+# ══════════════════════════════════════════════════════════
+def predict_window(Xw: np.ndarray, keras_model, mu, sd,
+                   lgbm=None, fusion_w: float = 0.5,
+                   stacker=None) -> float:
+    """
+    Xw: (T, 51)
+    fusion_w: peso para fusion lineal (ignorado si stacker != None)
+    stacker:  modelo meta-learner (LogisticRegression) entrenado sobre [p_lstm, p_lgbm]
+    """
+    # --- Keras (LSTM) ---
+    X = Xw[np.newaxis, ...]
+    X = norm_apply(X, mu, sd)
+    p_keras = float(keras_model(X, training=False).numpy().ravel()[0])
+
+    if lgbm is None or fusion_w <= 0.0:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    # --- LGBM ---
+    feat = featurize_T51(Xw)
+    expected = getattr(lgbm, "n_features_in_", None)
+    if expected is not None and feat.shape[1] != expected:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    try:
+        p_lgbm = float(lgbm.predict_proba(feat)[:, 1][0])
+    except Exception:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    # --- Fusion ---
+    if stacker is not None:
+        try:
+            meta_feat = np.array([[p_keras, p_lgbm]], dtype=np.float32)
+            p_fused = float(stacker.predict_proba(meta_feat)[:, 1][0])
+            return np.clip(p_fused, 0.0, 1.0)
+        except Exception:
+            pass
+
+    # Fallback: fusion lineal
+    return float(np.clip((1.0 - fusion_w) * p_keras + fusion_w * p_lgbm, 0.0, 1.0))
+
+
+# ══════════════════════════════════════════════════════════
+# Carga de artefactos (modelos + stats + threshold + stacker)
+# ══════════════════════════════════════════════════════════
+def load_artifacts(models_dir: str | Path, pose_weights: str):
+    """
+    Retorna: (keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker)
+    """
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU') 
+    
+    tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
+        tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
+    except RuntimeError:
+        pass
+    
+    from keras.models import load_model
+    from ultralytics import YOLO
+    import torch
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True   # Ada gana bastante con esto en matmuls
+    torch.backends.cudnn.allow_tf32 = True
+    
+    torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "2")))
+
+    models_dir = Path(models_dir)
+
+    keras_path  = models_dir / "v2_bilstm_attention.keras"
+    stats_path  = models_dir / "v2_norm_stats.npz"
+    thr_path    = models_dir / "v2_threshold.json"
+    lgbm_path   = models_dir / "lgbm_model.pkl"
+    stacker_path = models_dir / "stacker.pkl"
+
+    keras_model = load_model(str(keras_path), compile=False)
+
+    stats = np.load(stats_path)
+    mu = stats["mean"].astype("float32")
+    sd = stats["std"].astype("float32")
+
+    thr_on = 0.5
+    if thr_path.exists():
+        thr_on = float(json.loads(thr_path.read_text(encoding="utf-8")).get("best_threshold", 0.5))
+
+    # Override opcional por env var (sin tocar el JSON del modelo).
+    env_thr_on = os.getenv("THR_ON")
+    if env_thr_on:
+        try:
+            thr_on = float(env_thr_on)
+            print(f"[BOOT] THR_ON sobreescrito por env var -> {thr_on:.2f}")
+        except ValueError:
+            print(f"[BOOT] THR_ON env var invalido: {env_thr_on!r}")
+
+    thr_off = max(0.0, thr_on - HYST_GAP)
+    env_thr_off = os.getenv("THR_OFF")
+    if env_thr_off:
+        try:
+            thr_off = float(env_thr_off)
+            print(f"[BOOT] THR_OFF sobreescrito por env var -> {thr_off:.2f}")
+        except ValueError:
+            print(f"[BOOT] THR_OFF env var invalido: {env_thr_off!r}")
+
+    lgbm = None
+    if lgbm_path.exists():
+        try:
+            lgbm = joblib.load(lgbm_path)
+            print(f"[BOOT] LGBM cargado desde {lgbm_path}")
+        except Exception as e:
+            print(f"[BOOT] LGBM falló al cargar ({e}), continuo sin LGBM")
+
+    stacker = None
+    if stacker_path.exists():
+        try:
+            stacker = joblib.load(stacker_path)
+            print(f"[BOOT] Stacker cargado desde {stacker_path}")
+        except Exception as e:
+            print(f"[BOOT] Stacker falló ({e}), usando fusion lineal")
+
+    pose = YOLO(pose_weights)
+    if torch.cuda.is_available():
+        pose.to("cuda")
+    print("TF ve GPU:", tf.config.list_physical_devices('GPU'))
+    print("Torch ve GPU:", torch.cuda.is_available())
+    print("YOLO device:", pose.device)
+    print(f"[BOOT] Keras={keras_path.name} | THR_ON={thr_on:.2f} THR_OFF={thr_off:.2f}"
+          f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}"
+          f" | TF_threads={tf_threads} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
+
+    return keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker
+
+
+================================================================================
 Archivo: app/server_inference.py
 ================================================================================
 
 # uvicorn app.server_inference:app --host 0.0.0.0 --port 8000
 #
 # Servidor de INFERENCIA (se despliega en RunPod con GPU).
-#   - YOLO + LSTM + LGBM
-#   - WebSocket /ws/stream/{cam_id}?src=... para streaming + detección
+#   - YOLO (batcheado entre camaras) + LSTM + LGBM
+#   - WebSocket /ws/stream/{cam_id}?src=... para streaming + deteccion
 #   - /overlay/get y /overlay/set para togglear el render de poses
 #   - SIN base de datos, SIN auth, SIN HTML
 #
-# El src de la cámara se recibe como query param (lo envía el frontend),
-# así este servidor no necesita acceso a Supabase.
+# El src de la camara se recibe como query param (lo envia el frontend),
+# asi este servidor no necesita acceso a Supabase.
 
 import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+
 import time
 import base64
 import yt_dlp
@@ -8510,11 +8560,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import cv2
-
-from app.pipeline import (
-    SEQ_LEN, pool_frame_to_110, pool_scores,
-    predict_window, load_artifacts, smooth_window
-)
 
 try:
     cv2.setNumThreads(1)
@@ -8532,20 +8577,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.pipeline import (
     SEQ_LEN, pool_frame_to_110, pool_scores,
-    predict_window, load_artifacts,
+    predict_window, load_artifacts, smooth_window,
 )
 
 load_dotenv()
 log = logging.getLogger("inference")
 
 # ==========================================================
-# CONFIGURACIÓN
+# CONFIGURACION
 # ==========================================================
 MODELS_DIR   = Path(os.getenv("MODELS_DIR", "models_mix3"))
 POSE_WEIGHTS = os.getenv("POSE_WEIGHTS", "yolo11s-pose.pt")
 
 IMGSZ, CONF_POSE, IOU_POSE = 640, 0.25, 0.50
-TOPK = 4
 
 CONF_MIN     = 0.10
 POOL_METHOD  = "topk"
@@ -8555,6 +8599,13 @@ FUSION_W = 0.0
 
 VIDEO_MAX_SCORES = 900
 DRAW_OVERLAY     = True
+
+# Umbral de distancia (px) para considerar que una deteccion en el frame
+# actual es la misma persona que ocupaba un slot en el frame anterior.
+TRACK_DIST_PX = 300
+# Confianza minima para "reclamar" un slot libre (persona nueva en escena).
+TRACK_CONF_MIN = 0.70
+TRACK_MISSING_TOLERANCE = 15  # frames de tolerancia antes de soltar el slot
 
 # Override en runtime de los umbrales del modelo. None => usar el valor
 # cargado desde el JSON del modelo (o THR_ON/THR_OFF env var). Se puede
@@ -8568,8 +8619,15 @@ WARMUP_PREDS = int(os.getenv("WARMUP_PREDS", "32"))
 
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
+# TARGET_FPS ahora es la cadencia del scheduler GLOBAL (un tick procesa
+# TODAS las camaras activas en un solo batch), no un loop por camara.
+TARGET_FPS  = float(os.getenv("TARGET_FPS", "12"))
+INFER_SLEEP = max(0.0, 1.0 / TARGET_FPS)
+
+MAX_CAMERA_WORKERS = int(os.getenv("MAX_CAMERA_WORKERS", str(multiprocessing.cpu_count())))
+
 # Thread pool para operaciones bloqueantes (cv2, YOLO, Keras)
-_executor = ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() * 2)
+_executor = ThreadPoolExecutor(max_workers=MAX_CAMERA_WORKERS)
 
 # Modelos pesados: se cargan bajo demanda.
 ARTIFACTS = None
@@ -8609,7 +8667,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "models_loaded": ARTIFACTS is not None}
+    return {
+        "ok": True,
+        "models_loaded": ARTIFACTS is not None,
+        "target_fps": TARGET_FPS,
+        "max_camera_workers": MAX_CAMERA_WORKERS,
+        "active_cameras": len(WORKERS) if "WORKERS" in globals() else 0,
+    }
 
 
 # ── Overlay toggle ────────────────────────────────────────
@@ -8627,9 +8691,6 @@ def overlay_set(payload: dict = Body(...)):
 # ── Thresholds (runtime override) ─────────────────────────
 @app.get("/threshold/get")
 def threshold_get():
-    """
-    Devuelve umbrales efectivos (override si existe, sino los del modelo).
-    """
     thr_on_model = None
     thr_off_model = None
     if ARTIFACTS is not None:
@@ -8646,10 +8707,6 @@ def threshold_get():
 
 @app.post("/threshold/set")
 def threshold_set(payload: dict = Body(...)):
-    """
-    Setea override de THR_ON / THR_OFF. Manda null para limpiar override.
-    Body: { "thr_on": 0.70, "thr_off": 0.55 }
-    """
     global THR_ON_RUNTIME, THR_OFF_RUNTIME
     if "thr_on" in payload:
         v = payload["thr_on"]
@@ -8659,14 +8716,15 @@ def threshold_set(payload: dict = Body(...)):
         THR_OFF_RUNTIME = float(v) if v is not None else None
     return {"ok": True, "thr_on": THR_ON_RUNTIME, "thr_off": THR_OFF_RUNTIME}
 
+
 # ==========================================================
 # LECTOR DE VIDEO SIN LAG (TIEMPO REAL)
 # ==========================================================
 class RealTimeVideoReader:
     """
-    Hilo en segundo plano que siempre lee el frame más reciente.
-    Evita que el buffer de OpenCV se acumule cuando YOLO+LSTM
-    no alcanza a procesar tan rápido como llegan los frames de red.
+    Hilo en segundo plano que siempre lee el frame mas reciente.
+    Evita que el buffer de OpenCV se acumule cuando el scheduler
+    no alcanza a procesar tan rapido como llegan los frames de red.
     """
     def __init__(self, src):
         self.cap = cv2.VideoCapture(src)
@@ -8711,45 +8769,65 @@ class RealTimeVideoReader:
         if hasattr(self, 'thread'):
             self.thread.join(timeout=1.0)
         self.cap.release()
-        
-        
+
+
 # ==========================================================
 # CAMERA WORKER
 # ==========================================================
 class CameraWorker:
+    """
+    Ya NO corre su propio loop de inferencia. Solo abre la fuente de video,
+    sabe leer un frame cuando el scheduler se lo pide, y postprocesa el
+    resultado de YOLO que le llega ya calculado (en batch) desde afuera.
+    """
     def __init__(self, cam_id: str, src: str):
         self.cam_id = cam_id
         self.src = src
         self.clients: Set[WebSocket] = set()
         self.running = False
-        self.task = None
+        self.cap = None
+        self.is_live_stream = False
+        self.W: int = 0
+        self.H: int = 0
 
         self.win_feats = deque(maxlen=SEQ_LEN)
         self.video_scores = deque(maxlen=VIDEO_MAX_SCORES)
         self.on_state = False
         self.n_predictions = 0
-        self.W: int = 0
-        self.H: int = 0
-
-        # [NUEVO] Contadores para suavizar las alertas
         self.trigger_count = 0
         self.cooldown_count = 0
 
-        # [NUEVO] Memoria de Tracking para 2 personas principales
-        self.target_ids = [None, None]       # Guardará los IDs de tracking de YOLO
-        self.missing_frames = [0, 0]         # Tolerancia: frames que llevan desaparecidos
+        # Tracking online simple por centroide (reemplaza a ByteTrack,
+        # que no se puede batchear entre camaras con persist=True).
+        self.slot_centroids = [None, None]   # ultimo centroide (x,y) por slot
+        self.missing_frames = [0, 0]
 
-    async def start(self):
-        if not self.running:
-            self.running = True
-            self.task = asyncio.create_task(self._loop())
+    # -- ciclo de vida ---------------------------------------------------
+    async def start(self) -> bool:
+        if self.running:
+            return True
+        loop = asyncio.get_event_loop()
+        self.cap = await loop.run_in_executor(_executor, self._open_capture)
+        if self.cap is None:
+            await self._broadcast({"type": "error", "msg": "No se pudo abrir la fuente de video"})
+            return False
+        self.running = True
+        return True
+
+    async def stop(self):
+        self.running = False
+        cap = self.cap
+        self.cap = None
+        if cap is not None:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_executor, cap.release)
 
     def _open_capture(self):
         src = self.src
         is_network_stream = False
         self.is_live_stream = False
 
-        # --- LÓGICA DE YOUTUBE ---
+        # --- LOGICA DE YOUTUBE ---
         if isinstance(src, str) and ("youtube.com" in src or "youtu.be" in src):
             log.info(f"Detectado YouTube: {src}. Extrayendo stream...")
             try:
@@ -8767,17 +8845,16 @@ class CameraWorker:
                     src = info['url']
                     self.is_live_stream = bool(info.get('is_live'))
                     is_network_stream = True
-                    log.info(f"URL extraída OK. is_live={self.is_live_stream}")
+                    log.info(f"URL extraida OK. is_live={self.is_live_stream}")
             except Exception as e:
                 log.error(f"Error extrayendo URL de YouTube: {e}")
                 return None
 
         target_src = int(src) if str(src).isdigit() else src
-        if isinstance(target_src, str) and (target_src.startswith("http") or  target_src.startswith("rtsp")):
+        if isinstance(target_src, str) and (target_src.startswith("http") or target_src.startswith("rtsp")):
             is_network_stream = True
             os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "10000"
 
-        # --- SELECCIÓN DE LECTOR ---
         if is_network_stream:
             log.info("Usando RealTimeVideoReader (0 lag).")
             cap = RealTimeVideoReader(target_src)
@@ -8793,186 +8870,127 @@ class CameraWorker:
         self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return cap
 
-    def _grab_and_infer(self, cap) -> dict | None:
-        try:
-            ok, frame = cap.read()
-            if not ok:
-                # Live real de YouTube o RTSP: no hay "frame 0", se acabó de verdad.
-                if getattr(self, "is_live_stream", False):
-                    log.warning("Live stream finalizado/desconectado.")
-                    return None
-                # Video pregrabado (local o URL de YouTube normal): loop infinito.
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = cap.read()
-                if not ok:
-                    return None
-
-            # Cargamos los modelos (solo lo hace la primera vez)
-            keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker = get_artifacts()
-
-            # Override en caliente desde /threshold/set
-            if THR_ON_RUNTIME is not None:
-                thr_on = THR_ON_RUNTIME
-            if THR_OFF_RUNTIME is not None:
-                thr_off = THR_OFF_RUNTIME
-
-            res = pose.track(frame, imgsz=IMGSZ, conf=CONF_POSE, iou=IOU_POSE, 
-                             persist=True, tracker="bytetrack.yaml", verbose=False)[0]
-
-            # Inicializamos un array vacío para exactamente 2 personas (Top-2)
-            kps_f = np.zeros((2, 17, 3), dtype=np.float32)
-
-            if res.keypoints is not None and res.boxes is not None and res.boxes.id is not None:
-                xy = res.keypoints.xy.cpu().numpy()
-                c  = res.keypoints.conf.cpu().numpy()
-                ids = res.boxes.id.int().cpu().numpy()   # IDs únicos que da el tracker
-                confs = c.mean(axis=1)                   # Confianza media del esqueleto
-                
-                # 2. Verificar si nuestros objetivos actuales siguen en pantalla
-                for i in range(2):
-                    if self.target_ids[i] is not None:
-                        if self.target_ids[i] not in ids:
-                            # Se perdió de vista. Le damos 15 frames (~0.5s) de tolerancia antes de olvidarlo
-                            self.missing_frames[i] += 1
-                            if self.missing_frames[i] > 15:
-                                self.target_ids[i] = None
-                        else:
-                            self.missing_frames[i] = 0 # Lo vimos, reseteamos tolerancia
-                
-                # 3. Asignar nuevos objetivos si hay "huecos" libres
-                # Priorizamos a las personas con mayor confianza (ej: > 0.70)
-                available_indices = np.argsort(-confs) 
-                for idx in available_indices:
-                    current_id = ids[idx]
-                    current_conf = confs[idx]
-
-                    if current_id in self.target_ids:
-                        continue # Ya lo estamos trackeando
-                    
-                    # Umbral del 0.70 que mencionaste para decir "esto sí es una persona firme"
-                    if current_conf > 0.70:
-                        if self.target_ids[0] is None:
-                            self.target_ids[0] = current_id
-                            self.missing_frames[0] = 0
-                        elif self.target_ids[1] is None:
-                            self.target_ids[1] = current_id
-                            self.missing_frames[1] = 0
-
-                # 4. Extraer los keypoints en el ORDEN ESTRICTO de target_ids
-                for i in range(2):
-                    t_id = self.target_ids[i]
-                    if t_id is not None and t_id in ids:
-                        # Buscamos en qué índice de la salida actual de YOLO está nuestro actor
-                        idx_yolo = np.where(ids == t_id)[0][0]
-                        kps_f[i] = np.concatenate([xy[idx_yolo], c[idx_yolo, ..., None]], axis=-1)
-            
-            feat = pool_frame_to_110(kps_f, self.W, self.H, is_tracked=True)
-            self.win_feats.append(feat)
-
-            p_win, p_vid = 0.0, 0.0
-
-            if len(self.win_feats) == SEQ_LEN:
-                Xw = smooth_window(np.stack(self.win_feats))
-                
-                p_win = predict_window(Xw, keras_model, mu, sd,
-                        lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
-                self.n_predictions += 1
-                if self.n_predictions > WARMUP_PREDS:
-                    self.video_scores.append(p_win)
-                    p_vid = pool_scores(list(self.video_scores), pool=POOL_METHOD, topk_frac=TOPK_FRAC)
-
-            fired_alert = False
-            if self.n_predictions > WARMUP_PREDS:
-                
-                # 1. Si el score supera el umbral, empezamos a contar
-                if p_vid >= thr_on:
-                    self.trigger_count += 1
-                    self.cooldown_count = 0 # Se cancela el enfriamiento
-                    
-                    # Dispara la alerta solo si lleva 15 frames seguidos (~0.5 segundos) por encima del umbral
-                    if not self.on_state and self.trigger_count >= 15:
-                        self.on_state = True
-                        fired_alert = True
-                
-                # 2. Si el score baja del umbral de apagado, empezamos a enfriar
-                elif p_vid <= thr_off:
-                    self.cooldown_count += 1
-                    self.trigger_count = 0 # Se cancela el disparo
-                    
-                    # Apaga la alerta solo si lleva 30 frames seguidos (~1 segundo) en calma
-                    if self.on_state and self.cooldown_count >= 30:
-                        self.on_state = False
-                
-                # 3. Zona muerta (entre thr_off y thr_on)
-                else:
-                    # En la zona muerta no disparamos ni apagamos, pero reiniciamos contadores
-                    self.trigger_count = 0
-                    self.cooldown_count = 0
-
-            try:
-                shown = res.plot() if DRAW_OVERLAY else frame
-            except Exception:
-                shown = frame
-            
-            _, buf = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 65])
-            jpg = base64.b64encode(buf).decode()
-
-            now = time.time()
-            return {
-                "p_win": p_win,
-                "p_vid": p_vid,
-                "on": self.on_state,
-                "ts": now,
-                "jpg_b64": jpg,
-                "fired_alert": fired_alert,
-            }
-        
-        except Exception as e:
-            # Si hay un error (ej. falta un modelo), ahora sí nos lo dirá en la terminal
-            print(f"\n[ERROR CRITICO] Algo falló procesando el frame: {e}\n")
+    # -- lectura (llamada por el scheduler, dentro del executor) --------
+    def _read_frame_blocking(self):
+        if self.cap is None:
             return None
+        ok, frame = self.cap.read()
+        if not ok:
+            # Live real (YouTube live / RTSP): si se corta, se acabo de verdad.
+            if self.is_live_stream:
+                return None
+            # Video pregrabado: loop infinito.
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.cap.read()
+            if not ok:
+                return None
+        return frame
 
-    async def _loop(self):
-        loop = asyncio.get_event_loop()
+    # -- postprocesamiento de UN resultado de YOLO -----------------------
+    def process_result(self, res, frame) -> dict:
+        keras_model, mu, sd, thr_on, thr_off, lgbm, _pose, stacker = get_artifacts()
 
-        cap = await loop.run_in_executor(_executor, self._open_capture)
-        if cap is None:
-            await self._broadcast({"type": "error", "msg": "No se pudo abrir la fuente de video"})
-            self.running = False
-            return
+        if THR_ON_RUNTIME is not None:
+            thr_on = THR_ON_RUNTIME
+        if THR_OFF_RUNTIME is not None:
+            thr_off = THR_OFF_RUNTIME
+
+        kps_f = np.zeros((2, 17, 3), dtype=np.float32)
+
+        if res.keypoints is not None and res.keypoints.xy is not None and res.keypoints.xy.shape[0] > 0:
+            xy = res.keypoints.xy.cpu().numpy()  # (N,17,2)
+            c = res.keypoints.conf
+            c = c.cpu().numpy() if c is not None else np.ones(xy.shape[:2], dtype=np.float32)
+            confs = c.mean(axis=1)
+
+            def centroid(i):
+                valid = c[i] > 0.1
+                if not valid.any():
+                    return None
+                return xy[i, valid].mean(axis=0)
+
+            det_centroids = [centroid(i) for i in range(xy.shape[0])]
+            used = set()
+
+            # 1) Mantener cada slot con la deteccion mas cercana a su ultimo centroide
+            for slot in range(2):
+                if self.slot_centroids[slot] is None:
+                    continue
+                best_i, best_d = -1, 1e9
+                for i, cen in enumerate(det_centroids):
+                    if i in used or cen is None:
+                        continue
+                    d = float(np.linalg.norm(cen - self.slot_centroids[slot]))
+                    if d < best_d:
+                        best_d, best_i = d, i
+                if best_i != -1 and best_d < TRACK_DIST_PX:
+                    kps_f[slot] = np.concatenate([xy[best_i], c[best_i, ..., None]], axis=-1)
+                    self.slot_centroids[slot] = det_centroids[best_i]
+                    self.missing_frames[slot] = 0
+                    used.add(best_i)
+                else:
+                    self.missing_frames[slot] += 1
+                    if self.missing_frames[slot] > TRACK_MISSING_TOLERANCE:
+                        self.slot_centroids[slot] = None
+
+            # 2) Ocupar slots libres con detecciones nuevas de alta confianza
+            free_slots = [s for s in range(2) if self.slot_centroids[s] is None]
+            if free_slots:
+                candidates = sorted(
+                    (i for i in range(xy.shape[0]) if i not in used and confs[i] > TRACK_CONF_MIN),
+                    key=lambda i: -confs[i],
+                )
+                for slot, i in zip(free_slots, candidates):
+                    kps_f[slot] = np.concatenate([xy[i], c[i, ..., None]], axis=-1)
+                    self.slot_centroids[slot] = det_centroids[i]
+                    self.missing_frames[slot] = 0
+
+        feat = pool_frame_to_110(kps_f, self.W, self.H, is_tracked=True)
+        self.win_feats.append(feat)
+
+        p_win, p_vid = 0.0, 0.0
+        if len(self.win_feats) == SEQ_LEN:
+            Xw = smooth_window(np.stack(self.win_feats))
+            p_win = predict_window(Xw, keras_model, mu, sd,
+                                   lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
+            self.n_predictions += 1
+            if self.n_predictions > WARMUP_PREDS:
+                self.video_scores.append(p_win)
+                p_vid = pool_scores(list(self.video_scores), pool=POOL_METHOD, topk_frac=TOPK_FRAC)
+
+        fired_alert = False
+        if self.n_predictions > WARMUP_PREDS:
+            if p_vid >= thr_on:
+                self.trigger_count += 1
+                self.cooldown_count = 0
+                if not self.on_state and self.trigger_count >= 15:
+                    self.on_state = True
+                    fired_alert = True
+            elif p_vid <= thr_off:
+                self.cooldown_count += 1
+                self.trigger_count = 0
+                if self.on_state and self.cooldown_count >= 30:
+                    self.on_state = False
+            else:
+                self.trigger_count = 0
+                self.cooldown_count = 0
 
         try:
-            while self.running and self.clients:
-                result = await loop.run_in_executor(_executor, self._grab_and_infer, cap)
-                
-                if result is None:
-                    await self._broadcast({"type": "error", "msg": "Fin del stream"})
-                    break
+            shown = res.plot() if DRAW_OVERLAY else frame
+        except Exception:
+            shown = frame
 
-                if result["fired_alert"]:
-                    await self._broadcast({
-                        "type": "alert",
-                        "cam_id": self.cam_id,
-                        "prob": result["p_vid"],
-                        "ts": result["ts"],
-                    })
+        _, buf = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        jpg = base64.b64encode(buf).decode()
 
-                await self._broadcast({
-                    "type": "frame",
-                    "cam_id": self.cam_id,
-                    "p_win": result["p_win"],
-                    "p_vid": result["p_vid"],
-                    "on": result["on"],
-                    "ts": result["ts"],
-                    "jpg_b64": result["jpg_b64"],
-                })
-
-                # MAGIA 2: Frenamos el servidor 0.03 segundos para que vaya a 30 FPS.
-                # ¡Esto evita que el navegador colapse y quite la pantalla negra!
-                await asyncio.sleep(0.033)
-        finally:
-            await loop.run_in_executor(_executor, cap.release)
-            self.running = False
+        return {
+            "p_win": p_win,
+            "p_vid": p_vid,
+            "on": self.on_state,
+            "ts": time.time(),
+            "jpg_b64": jpg,
+            "fired_alert": fired_alert,
+        }
 
     async def _broadcast(self, msg: dict):
         dead = []
@@ -8983,6 +9001,105 @@ class CameraWorker:
                 dead.append(ws)
         for ws in dead:
             self.clients.discard(ws)
+
+
+# ==========================================================
+# SCHEDULER GLOBAL (un solo loop batchea TODAS las camaras)
+# ==========================================================
+class InferenceScheduler:
+    def __init__(self):
+        self.running = False
+        self.task = None
+
+    async def start(self):
+        if not self.running:
+            self.running = True
+            self.task = asyncio.create_task(self._loop())
+
+    async def _loop(self):
+        loop = asyncio.get_event_loop()
+        while self.running:
+            t0 = time.time()
+            try:
+                results = await loop.run_in_executor(_executor, self._tick_blocking)
+            except Exception as e:
+                log.error(f"[scheduler] tick fallo: {e}")
+                results = []
+
+            for cam_id, result in results:
+                worker = WORKERS.get(cam_id)
+                if worker is None:
+                    continue
+
+                if result is None:
+                    await worker._broadcast({"type": "error", "msg": "Fin del stream"})
+                    await worker.stop()
+                    continue
+
+                if result["fired_alert"]:
+                    await worker._broadcast({
+                        "type": "alert",
+                        "cam_id": cam_id,
+                        "prob": result["p_vid"],
+                        "ts": result["ts"],
+                    })
+
+                await worker._broadcast({
+                    "type": "frame",
+                    "cam_id": cam_id,
+                    "p_win": result["p_win"],
+                    "p_vid": result["p_vid"],
+                    "on": result["on"],
+                    "ts": result["ts"],
+                    "jpg_b64": result["jpg_b64"],
+                })
+
+            elapsed = time.time() - t0
+            await asyncio.sleep(max(0.0, INFER_SLEEP - elapsed))
+
+    def _tick_blocking(self):
+        """
+        Corre dentro del executor (thread aparte). Lee un frame de cada
+        camara activa, arma UN solo batch, llama a YOLO una vez, y
+        postprocesa por camara. Devuelve [(cam_id, result_dict|None), ...]
+        """
+        active = [(cid, w) for cid, w in list(WORKERS.items())
+                 if w.running and w.clients and w.cap is not None]
+        if not active:
+            return []
+
+        out = []
+        frames, valid = [], []
+        for cam_id, w in active:
+            frame = w._read_frame_blocking()
+            if frame is None:
+                out.append((cam_id, None))
+                continue
+            frames.append(frame)
+            valid.append((cam_id, w, frame))
+
+        if not frames:
+            return out
+
+        _, _, _, _, _, _, pose_model, _ = get_artifacts()
+
+        results = pose_model.predict(
+            frames, imgsz=IMGSZ, conf=CONF_POSE, iou=IOU_POSE,
+            verbose=False, half=True,
+        )
+
+        for (cam_id, w, frame), res in zip(valid, results):
+            out.append((cam_id, w.process_result(res, frame)))
+
+        return out
+
+
+SCHEDULER = InferenceScheduler()
+
+
+@app.on_event("startup")
+async def _on_startup():
+    await SCHEDULER.start()
 
 
 # ── WebSocket endpoint ────────────────────────────────────
@@ -9006,7 +9123,10 @@ async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
     if not worker or not worker.running:
         worker = CameraWorker(cam_id, src)
         WORKERS[cam_id] = worker
-        await worker.start()
+        ok = await worker.start()
+        if not ok:
+            await ws.close()
+            return
 
     worker.clients.add(ws)
     try:
@@ -9014,38 +9134,8 @@ async def ws_stream(ws: WebSocket, cam_id: str, src: str = ""):
             await ws.receive_text()
     except WebSocketDisconnect:
         worker.clients.discard(ws)
-
-
-================================================================================
-Archivo: app/cookies.txt
-================================================================================
-
-# Netscape HTTP Cookie File
-# https://curl.haxx.se/rfc/cookie_spec.html
-# This is a generated file! Do not edit.
-
-.youtube.com	TRUE	/	TRUE	1796170537	SOCS	CAISEwgDEgk5MjY0MTExMjMaAmVuIAEaBgiAo4jRBg
-.youtube.com	TRUE	/	FALSE	1800744960	HSID	AHZ8au6Qnp1OdkUFc
-.youtube.com	TRUE	/	TRUE	1800744960	SSID	AtSuUEUWAKGlUWpV5
-.youtube.com	TRUE	/	FALSE	1800744960	APISID	kF_NYG55z1RHUJq_/ABod86OrDdY7DGRZR
-.youtube.com	TRUE	/	TRUE	1800744960	SAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
-.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
-.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PAPISID	eyCutVuNmysWcEEf/ASNkfQvKpXJkFQrGj
-.youtube.com	TRUE	/	TRUE	1797958274	LOGIN_INFO	AFmmF2swRAIgKG3Yat1zohGzQfz7KJwGgcjmrFuTp9GWnQM8iJnY350CIFLxI2MyqfjHD43e6T2BF-EV_CSo9IkjoIYY2c_3ozP6:QUQ3MjNmelFBSGRkZkxkcUFOVHRfcy1sMkY4LU9ZZkJ6TUVkSHNwOG9wNks5NUVmZGk4bnJRRWhiWjBVaTlaLUU3Z2FoRVM5T1NmdFIxVWJDZ0ZWaDN5ZlhLZzZ4V1lpclBURUQ0YlJVV243QkZKLTdrVm83WmloaWktUjVVdUxsa1BpN3FxRnVxUVllWkFCZlZEUzJfMnVadlloMGlXaFp3
-.youtube.com	TRUE	/	FALSE	1800744960	SID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyIEDzczfkbLdnDHbeCWWtawACgYKAXASARYSFQHGX2Miufx6iX5nCkvnvWMoOvOWvhoVAUF8yKq3N8arwSBfajTtfjW4-6-l0076
-.youtube.com	TRUE	/	TRUE	1800744960	__Secure-1PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuynbIK6didk4IdKYu8EkKDtAACgYKAUkSARYSFQHGX2Mi34A6Tqo0pPmvmefoMoSA5RoVAUF8yKrD1FfsH39FnG-bio3qGddG0076
-.youtube.com	TRUE	/	TRUE	1800744960	__Secure-3PSID	g.a000AwliKGfYxoD7zgnrsXUrhRBrwz1kkGc8sUg5yUe9H_NU1xuyl-dP33vjcSJQ8OpKJbIBbAACgYKAWESARYSFQHGX2Mi_KP1IjhvM7hkyInjr69cRhoVAUF8yKqkl5uLA3qPrWoUBx6xuBJm0076
-.youtube.com	TRUE	/	TRUE	1801000432	PREF	f6=40000000&tz=America.Los_Angeles&f7=100&f4=10000
-.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
-.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDTS	sidts-CjQBPWEu2SBrLMscxOMZLzEihjNEFy55wvK_TSY-Qkc1InBqiFjC0FbAr1IKfE-TMhIseL7YEAA
-.youtube.com	TRUE	/	FALSE	1801000421	SIDCC	AKEyXzV-11HZf5ttKl-sRnhPwNE--SHpit5asDAaW-Sa0FwtNhWzt2yRqxZEL3bTlg3qsDAFYQ
-.youtube.com	TRUE	/	TRUE	1801000421	__Secure-1PSIDCC	AKEyXzWPKVTLp5KIZ64HeWbzwOv8Pgm4cBxpnBzV_L35xwF4VGgrJgmDLwJ89hiQNS8cAghd
-.youtube.com	TRUE	/	TRUE	1801000421	__Secure-3PSIDCC	AKEyXzX-H26VZZ6_9Gy6q2vVZAoj5kw_Gk0rLoeRCr0I-zL6GUIR3mQt0-bNMTkLN9TVx-3A
-.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_INFO1_LIVE	9aBaVg_bbBo
-.youtube.com	TRUE	/	TRUE	1801000414	VISITOR_PRIVACY_METADATA	CgJOTBIiEh4SHAsMDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicgPw%3D%3D
-.youtube.com	TRUE	/	TRUE	1800917553	__Secure-YNID	20.YT=OnkJTjNMUh1swUHNSuvrxkjCe3-IIRKLJfXKMv9NR9c5fLJfqYt7huabCrxe6_MmVtyr_mch1QYTEyJZwwVEFq8h6Jzbz90tjRhpkLgv7k3F8tIekr7hGdY_9Hd1DeoKFVAUpA2kxFlaEgO3JOPihTKBN5DRWj0_8rut8nvMQpcJW7DOkgubGF38OUFysSo_80UbjdJN9fkzGHsqCzu6M2gIuqOZ-Y3K6KJDZADeD0qyinU6t-4XctD1w_hJtRZI6FuJuU0yoFCChPvxNDrWROw-HuefDx3j6vLDPtUsVzbA9-4gCd7I9_9MOs9vufr27dK246MIZEZnY-0Wq06lcw
-.youtube.com	TRUE	/	TRUE	1800917553	__Secure-ROLLOUT_TOKEN	CPHZzYf6up3U4wEQj9y8tozElAMYno3z8_z4lQM%3D
-.youtube.com	TRUE	/	TRUE	0	YSC	oq25gmrF4PU
+        if not worker.clients:
+            await worker.stop()
 
 
 ================================================================================

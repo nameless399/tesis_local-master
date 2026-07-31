@@ -354,6 +354,9 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     from keras.models import load_model
     from ultralytics import YOLO
     import torch
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True   # Ada gana bastante con esto en matmuls
+    torch.backends.cudnn.allow_tf32 = True
     
     torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "2")))
 
