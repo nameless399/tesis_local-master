@@ -342,14 +342,22 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     Retorna: (keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker)
     """
     import tensorflow as tf
-    tf.config.set_visible_devices([], 'GPU') 
-    
-    tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
-    try:
-        tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
-        tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
-    except RuntimeError:
-        pass
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        # Deja correr el LSTM en la 4090. set_memory_growth evita que TF
+        # reserve toda la VRAM de una vez y le quite espacio a YOLO.
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+    else:
+        tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
+            tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
+        except RuntimeError:
+            pass
     
     from keras.models import load_model
     from ultralytics import YOLO

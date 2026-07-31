@@ -78,7 +78,8 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 log "lanzando uvicorn en tmux ($SESSION) puerto $PORT"
 : > "$LOG_FILE"
 tmux new -d -s "$SESSION" \
-  "cd $APP_DIR && MODELS_DIR=$MODELS_DIR POSE_WEIGHTS=$POSE_WEIGHTS THR_ON=$THR_ON THR_OFF=$THR_OFF uvicorn app.server_inference:app --host 0.0.0.0 --port $PORT 2>&1 | tee $LOG_FILE"
+  "cd $APP_DIR && MODELS_DIR=$MODELS_DIR POSE_WEIGHTS=$POSE_WEIGHTS THR_ON=$THR_ON THR_OFF=$THR_OFF MAX_CAMERA_WORKERS=32 uvicorn app.server_inference:app --host 0.0.0.0 --port $PORT 2>&1 | tee $LOG_FILE"
+  
 
 # ── 6) Health check con reintentos ───────────────────────
 log "esperando a que /health responda (hasta 90s)"
