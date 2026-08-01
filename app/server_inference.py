@@ -92,7 +92,7 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 # TARGET_FPS ahora es la cadencia del scheduler GLOBAL (un tick procesa
 # TODAS las camaras activas en un solo batch), no un loop por camara.
-TARGET_FPS  = float(os.getenv("TARGET_FPS", "24"))
+TARGET_FPS  = float(os.getenv("TARGET_FPS", "40"))
 INFER_SLEEP = max(0.0, 1.0 / TARGET_FPS)
 
 MAX_CAMERA_WORKERS = int(os.getenv("MAX_CAMERA_WORKERS", str(multiprocessing.cpu_count())))
