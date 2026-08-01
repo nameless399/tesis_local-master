@@ -11,11 +11,11 @@
 
 import os
 
-os.environ.setdefault("OMP_NUM_THREADS", "8")
-os.environ.setdefault("MKL_NUM_THREADS", "8")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("TF_NUM_THREADS", "8")
-os.environ.setdefault("TORCH_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "20")
+os.environ.setdefault("MKL_NUM_THREADS", "20")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("TF_NUM_THREADS", "20")
+os.environ.setdefault("TORCH_NUM_THREADS", "2")
 import time
 import base64
 import yt_dlp
