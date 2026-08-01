@@ -289,7 +289,13 @@ def norm_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
     X2 = X.reshape(-1, F)
     Xn = (X2 - mu) / (sd + 1e-6)
     return Xn.reshape(1, T, F).astype("float32")
-
+    
+def norm_apply_batch(Xb: np.ndarray, mu, sd) -> np.ndarray:
+    """Xb: (N, T, 51) -> normalizado, misma forma. Version batcheada de norm_apply."""
+    N, T, F = Xb.shape
+    X2 = Xb.reshape(-1, F)
+    Xn = (X2 - mu) / (sd + 1e-6)
+    return Xn.reshape(N, T, F).astype("float32")
 # ══════════════════════════════════════════════════════════
 # Cache de forward compilado (evita overhead de modo eager en LSTM)
 # ══════════════════════════════════════════════════════════
@@ -353,7 +359,43 @@ def predict_window(Xw: np.ndarray, keras_model, mu, sd,
     # Fallback: fusion lineal
     return float(np.clip((1.0 - fusion_w) * p_keras + fusion_w * p_lgbm, 0.0, 1.0))
 
+def predict_window_batch(Xw_batch: np.ndarray, keras_model, mu, sd,
+                          lgbm=None, fusion_w: float = 0.5,
+                          stacker=None) -> np.ndarray:
+    """
+    Xw_batch: (N, T, 51) -> (N,) probabilidades.
+    Version batcheada de predict_window: UN solo forward pass de Keras
+    (y una sola llamada a LGBM) para todas las camaras del tick, en vez
+    de N llamadas separadas por camara.
+    """
+    X = norm_apply_batch(Xw_batch, mu, sd)
+    forward = _get_compiled_forward(keras_model)
+    p_keras = forward(X).numpy().ravel()  # (N,)
 
+    if lgbm is None or fusion_w <= 0.0:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    feats = np.concatenate(
+        [featurize_T51(Xw_batch[i]) for i in range(Xw_batch.shape[0])], axis=0
+    )
+    expected = getattr(lgbm, "n_features_in_", None)
+    if expected is not None and feats.shape[1] != expected:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    try:
+        p_lgbm = lgbm.predict_proba(feats)[:, 1]
+    except Exception:
+        return np.clip(p_keras, 0.0, 1.0)
+
+    if stacker is not None:
+        try:
+            meta_feat = np.stack([p_keras, p_lgbm], axis=1).astype(np.float32)
+            p_fused = stacker.predict_proba(meta_feat)[:, 1]
+            return np.clip(p_fused, 0.0, 1.0)
+        except Exception:
+            pass
+
+    return np.clip((1.0 - fusion_w) * p_keras + fusion_w * p_lgbm, 0.0, 1.0)
 # ══════════════════════════════════════════════════════════
 # Carga de artefactos (modelos + stats + threshold + stacker)
 # ══════════════════════════════════════════════════════════

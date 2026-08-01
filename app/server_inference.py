@@ -47,7 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.pipeline import (
     SEQ_LEN, pool_frame_to_110, pool_scores,
-    predict_window, load_artifacts, smooth_window,
+    predict_window_batch, load_artifacts, smooth_window,
 )
 
 load_dotenv()
@@ -270,6 +270,8 @@ class CameraWorker:
         self.n_predictions = 0
         self.trigger_count = 0
         self.cooldown_count = 0
+        self._pending_res = None
+        self._pending_frame = None
 
         # Tracking online simple por centroide (reemplaza a ByteTrack,
         # que no se puede batchear entre camaras con persist=True).
@@ -361,18 +363,15 @@ class CameraWorker:
         return frame
 
     # -- postprocesamiento de UN resultado de YOLO -----------------------
-    def process_result(self, res, frame) -> dict:
-        keras_model, mu, sd, thr_on, thr_off, lgbm, _pose, stacker = get_artifacts()
-
-        if THR_ON_RUNTIME is not None:
-            thr_on = THR_ON_RUNTIME
-        if THR_OFF_RUNTIME is not None:
-            thr_off = THR_OFF_RUNTIME
+    # -- Parte 1: tracking + pooling (paralelo, NO llama al modelo) ------
+    def prepare_window(self, res, frame):
+        self._pending_res = res
+        self._pending_frame = frame
 
         kps_f = np.zeros((2, 17, 3), dtype=np.float32)
 
         if res.keypoints is not None and res.keypoints.xy is not None and res.keypoints.xy.shape[0] > 0:
-            xy = res.keypoints.xy.cpu().numpy()  # (N,17,2)
+            xy = res.keypoints.xy.cpu().numpy()
             c = res.keypoints.conf
             c = c.cpu().numpy() if c is not None else np.ones(xy.shape[:2], dtype=np.float32)
             confs = c.mean(axis=1)
@@ -386,7 +385,6 @@ class CameraWorker:
             det_centroids = [centroid(i) for i in range(xy.shape[0])]
             used = set()
 
-            # 1) Mantener cada slot con la deteccion mas cercana a su ultimo centroide
             for slot in range(2):
                 if self.slot_centroids[slot] is None:
                     continue
@@ -407,7 +405,6 @@ class CameraWorker:
                     if self.missing_frames[slot] > TRACK_MISSING_TOLERANCE:
                         self.slot_centroids[slot] = None
 
-            # 2) Ocupar slots libres con detecciones nuevas de alta confianza
             free_slots = [s for s in range(2) if self.slot_centroids[s] is None]
             if free_slots:
                 candidates = sorted(
@@ -422,15 +419,20 @@ class CameraWorker:
         feat = pool_frame_to_110(kps_f, self.W, self.H, is_tracked=True)
         self.win_feats.append(feat)
 
-        p_win, p_vid = 0.0, 0.0
         if len(self.win_feats) == SEQ_LEN:
-            Xw = smooth_window(np.stack(self.win_feats))
-            p_win = predict_window(Xw, keras_model, mu, sd,
-                                   lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
+            return smooth_window(np.stack(self.win_feats))
+        return None
+
+    # -- Parte 2: estado de alerta + JPEG (paralelo, tras el forward batcheado) --
+    def finalize(self, p_win, thr_on, thr_off) -> dict:
+        p_vid = 0.0
+        if p_win is not None:
             self.n_predictions += 1
             if self.n_predictions > WARMUP_PREDS:
                 self.video_scores.append(p_win)
                 p_vid = pool_scores(list(self.video_scores), pool=POOL_METHOD, topk_frac=TOPK_FRAC)
+        else:
+            p_win = 0.0
 
         fired_alert = False
         if self.n_predictions > WARMUP_PREDS:
@@ -450,10 +452,14 @@ class CameraWorker:
                 self.cooldown_count = 0
 
         try:
-            shown = res.plot() if DRAW_OVERLAY else frame
+            shown = self._pending_res.plot() if DRAW_OVERLAY else self._pending_frame
         except Exception:
-            shown = frame
-
+            shown = self._pending_frame
+        
+        if shown.shape[1] > 960:
+            scale = 960 / shown.shape[1]
+            shown = cv2.resize(shown, (960, int(shown.shape[0] * scale)))
+        
         _, buf = cv2.imencode(".jpg", shown, [cv2.IMWRITE_JPEG_QUALITY, 65])
         jpg = base64.b64encode(buf).decode()
 
@@ -535,7 +541,7 @@ class InferenceScheduler:
         if not valid:
             return
 
-        # ── Fase 2: UNA sola llamada batcheada a la GPU ──
+        # ── Fase 2: UNA sola llamada batcheada a la GPU (YOLO) ──
         _, _, _, _, _, _, pose_model, _ = get_artifacts()
         frames = [f for _, _, f in valid]
 
@@ -550,22 +556,46 @@ class InferenceScheduler:
         results = await loop.run_in_executor(_executor, run_batch)
         t_yolo = time.time() - t_yolo0
 
-        # ── Fase 3: postprocesamiento (LSTM + JPEG) EN PARALELO ──
+        # ── Fase 3a: tracking + pooling EN PARALELO (sin llamar al modelo) ──
         t_post0 = time.time()
-        post_tasks = [
-            loop.run_in_executor(_executor, w.process_result, res, frame)
+        prep_tasks = [
+            loop.run_in_executor(_executor, w.prepare_window, res, frame)
             for (cam_id, w, frame), res in zip(valid, results)
         ]
-        post_results = await asyncio.gather(*post_tasks)
+        Xw_list = await asyncio.gather(*prep_tasks)
+
+        # ── Fase 3b: UN solo forward pass batcheado (LSTM + LGBM) ──
+        keras_model, mu, sd, thr_on, thr_off, lgbm, _pose, stacker = get_artifacts()
+        if THR_ON_RUNTIME is not None:
+            thr_on = THR_ON_RUNTIME
+        if THR_OFF_RUNTIME is not None:
+            thr_off = THR_OFF_RUNTIME
+
+        idx_ready = [i for i, Xw in enumerate(Xw_list) if Xw is not None]
+        p_win_by_idx = [None] * len(Xw_list)
+        if idx_ready:
+            Xw_batch = np.stack([Xw_list[i] for i in idx_ready])
+
+            def run_lstm_batch():
+                return predict_window_batch(Xw_batch, keras_model, mu, sd,
+                                             lgbm=lgbm, fusion_w=FUSION_W, stacker=stacker)
+
+            p_batch = await loop.run_in_executor(_executor, run_lstm_batch)
+            for i, p in zip(idx_ready, p_batch):
+                p_win_by_idx[i] = float(p)
+
+        # ── Fase 3c: estado de alerta + JPEG EN PARALELO ──
+        finalize_tasks = [
+            loop.run_in_executor(_executor, w.finalize, p_win_by_idx[i], thr_on, thr_off)
+            for i, (cam_id, w, frame) in enumerate(valid)
+        ]
+        post_results = await asyncio.gather(*finalize_tasks)
         t_post = time.time() - t_post0
 
-        log.warning(
-            f"[tick-breakdown] read={t_read*1000:.0f}ms  yolo={t_yolo*1000:.0f}ms  "
-            f"post={t_post*1000:.0f}ms  (n_cams={len(valid)})"
-        )
+        # ── Fase 4: broadcast EN PARALELO ──
+        t_bcast0 = time.time()
 
-        # ── Fase 4: broadcast ──
-        for (cam_id, w, _), result in zip(valid, post_results):
+        async def _send_one(cam_id, w, result):
             if result["fired_alert"]:
                 await w._broadcast({
                     "type": "alert",
@@ -573,7 +603,6 @@ class InferenceScheduler:
                     "prob": result["p_vid"],
                     "ts": result["ts"],
                 })
-
             await w._broadcast({
                 "type": "frame",
                 "cam_id": cam_id,
@@ -583,6 +612,17 @@ class InferenceScheduler:
                 "ts": result["ts"],
                 "jpg_b64": result["jpg_b64"],
             })
+
+        await asyncio.gather(*[
+            _send_one(cam_id, w, result)
+            for (cam_id, w, _), result in zip(valid, post_results)
+        ])
+        t_bcast = time.time() - t_bcast0
+
+        log.warning(
+            f"[tick-breakdown] read={t_read*1000:.0f}ms  yolo={t_yolo*1000:.0f}ms  "
+            f"post={t_post*1000:.0f}ms  bcast={t_bcast*1000:.0f}ms  (n_cams={len(valid)})"
+        )
 
 SCHEDULER = InferenceScheduler()
 
