@@ -290,6 +290,25 @@ def norm_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
     Xn = (X2 - mu) / (sd + 1e-6)
     return Xn.reshape(1, T, F).astype("float32")
 
+# ══════════════════════════════════════════════════════════
+# Cache de forward compilado (evita overhead de modo eager en LSTM)
+# ══════════════════════════════════════════════════════════
+_COMPILED_FORWARD_CACHE = {}
+
+
+def _get_compiled_forward(keras_model):
+    key = id(keras_model)
+    fn = _COMPILED_FORWARD_CACHE.get(key)
+    if fn is None:
+        import tensorflow as tf
+
+        @tf.function(reduce_retracing=True)
+        def _forward(x):
+            return keras_model(x, training=False)
+
+        fn = _forward
+        _COMPILED_FORWARD_CACHE[key] = fn
+    return fn
 
 # ══════════════════════════════════════════════════════════
 # Predicción fusionada  LSTM + LGBM (soporta stacking)
@@ -305,7 +324,8 @@ def predict_window(Xw: np.ndarray, keras_model, mu, sd,
     # --- Keras (LSTM) ---
     X = Xw[np.newaxis, ...]
     X = norm_apply(X, mu, sd)
-    p_keras = float(keras_model(X, training=False).numpy().ravel()[0])
+    forward = _get_compiled_forward(keras_model)
+    p_keras = float(forward(X).numpy().ravel()[0])
 
     if lgbm is None or fusion_w <= 0.0:
         return np.clip(p_keras, 0.0, 1.0)
