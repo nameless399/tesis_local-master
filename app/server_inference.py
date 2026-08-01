@@ -520,9 +520,11 @@ class InferenceScheduler:
             return
 
         # ── Fase 1: lectura de frames EN PARALELO ──
+        t_read0 = time.time()
         read_tasks = [loop.run_in_executor(_executor, w._read_frame_blocking)
                      for _, w in active]
         frames_raw = await asyncio.gather(*read_tasks)
+        t_read = time.time() - t_read0
 
         dead  = [(cid, w) for (cid, w), f in zip(active, frames_raw) if f is None]
         valid = [(cid, w, f) for (cid, w), f in zip(active, frames_raw) if f is not None]
@@ -545,14 +547,23 @@ class InferenceScheduler:
                 verbose=False, half=use_half,
             )
 
+        t_yolo0 = time.time()
         results = await loop.run_in_executor(_executor, run_batch)
+        t_yolo = time.time() - t_yolo0
 
         # ── Fase 3: postprocesamiento (LSTM + JPEG) EN PARALELO ──
+        t_post0 = time.time()
         post_tasks = [
             loop.run_in_executor(_executor, w.process_result, res, frame)
             for (cam_id, w, frame), res in zip(valid, results)
         ]
         post_results = await asyncio.gather(*post_tasks)
+        t_post = time.time() - t_post0
+
+        log.warning(
+            f"[tick-breakdown] read={t_read*1000:.0f}ms  yolo={t_yolo*1000:.0f}ms  "
+            f"post={t_post*1000:.0f}ms  (n_cams={len(valid)})"
+        )
 
         # ── Fase 4: broadcast ──
         for (cam_id, w, _), result in zip(valid, post_results):

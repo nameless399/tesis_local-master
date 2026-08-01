@@ -342,22 +342,14 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     Retorna: (keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker)
     """
     import tensorflow as tf
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        # Deja correr el LSTM en la 4090. set_memory_growth evita que TF
-        # reserve toda la VRAM de una vez y le quite espacio a YOLO.
-        for gpu in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError:
-                pass
-    else:
-        tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
-        try:
-            tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
-            tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
-        except RuntimeError:
-            pass
+    tf.config.set_visible_devices([], 'GPU')
+
+    tf_threads = int(os.getenv("TF_NUM_THREADS", "2"))
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(tf_threads)
+        tf.config.threading.set_inter_op_parallelism_threads(tf_threads)
+    except RuntimeError:
+        pass
     
     from keras.models import load_model
     from ultralytics import YOLO
@@ -426,9 +418,8 @@ def load_artifacts(models_dir: str | Path, pose_weights: str):
     print("TF ve GPU:", tf.config.list_physical_devices('GPU'))
     print("Torch ve GPU:", torch.cuda.is_available())
     print("YOLO device:", pose.device)
-    tf_threads_label = "GPU" if gpus else tf_threads
     print(f"[BOOT] Keras={keras_path.name} | THR_ON={thr_on:.2f} THR_OFF={thr_off:.2f}"
           f" | LGBM={'ON' if lgbm else 'OFF'} | Stacker={'ON' if stacker else 'OFF'}"
-          f" | TF_threads={tf_threads_label} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
+          f" | TF_threads={tf_threads} | Torch_threads={os.getenv('TORCH_NUM_THREADS', '2')}")
 
     return keras_model, mu, sd, thr_on, thr_off, lgbm, pose, stacker
